@@ -1,0 +1,48 @@
+name: pods
+version: 1.0.0
+commit_hash: d9bf98c
+uncommitted_changes: false
+jobs:
+- name: podman
+  version: 735d46585a4207183c1ca11ee8587a6b7bae334824ffb3f6ed2b0bfc3e431785
+  fingerprint: 735d46585a4207183c1ca11ee8587a6b7bae334824ffb3f6ed2b0bfc3e431785
+  sha1: sha256:22edfb3565e1d655fee7bdd1c0f3af3251739c5a5a848345c86c38233815d636
+  packages:
+  - podman
+  - common
+- name: podman-exporter
+  version: ce2d67c8b5ded15e7c7b0476420a21ef2d653a9c4618441bfbabadfeb6decab0
+  fingerprint: ce2d67c8b5ded15e7c7b0476420a21ef2d653a9c4618441bfbabadfeb6decab0
+  sha1: sha256:abb0c9658bf3138602bc9b0759b1139cf31a73ebfc0064ddf89ba31c4903e4ed
+  packages:
+  - podman-exporter
+  - common
+- name: pods
+  version: a8d534d76b2cc837842fa2f746adb28c003b615e838437712d5be772c1e07029
+  fingerprint: a8d534d76b2cc837842fa2f746adb28c003b615e838437712d5be772c1e07029
+  sha1: sha256:860194470a3b3ad9b8620c55fd443b6f2ec0a616f9be0d950737e26e636f4827
+  packages:
+  - podman
+  - common
+packages:
+- name: common
+  version: aede33230ce40be193ad992ba007290570178383c0874728ca6444279dcbbfdd
+  fingerprint: aede33230ce40be193ad992ba007290570178383c0874728ca6444279dcbbfdd
+  sha1: sha256:974b7802e6f7694942807e3723b1351c81a41a6ffabeede10a6c4224abb77dd1
+  dependencies: []
+- name: golang-1.27-linux
+  version: 4a5b3ef32c78d96b58195b90b0fd51789f48090991bef36ca5df0af1b3453544
+  fingerprint: 4a5b3ef32c78d96b58195b90b0fd51789f48090991bef36ca5df0af1b3453544
+  sha1: sha256:b61a499d93f11f51281eafcc64c22225dd3964b9e1e72cd6892c8bd9bf04b5b6
+  dependencies: []
+- name: podman
+  version: 02a172830d41448d82b686784c11320d3a8cef48a9d15450ac38964570b7b7b8
+  fingerprint: 02a172830d41448d82b686784c11320d3a8cef48a9d15450ac38964570b7b7b8
+  sha1: sha256:2e58d733005f0b02c451bb53df505bb4de1fb74b28efac2eb474e3b6b842fe8f
+  dependencies: []
+- name: podman-exporter
+  version: d299c821a5c68e6ab866f80064c7eca4ccf0944a5355a6881b09f66dddc69d5b
+  fingerprint: d299c821a5c68e6ab866f80064c7eca4ccf0944a5355a6881b09f66dddc69d5b
+  sha1: sha256:8cee651a6e959bb9378f4e5a44a88017238cb7947d95a9e35302bc826660111f
+  dependencies:
+  - golang-1.27-linux
