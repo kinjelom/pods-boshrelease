@@ -1,0 +1,3 @@
+instances: 1
+azs: [z1]
+pods_exporter_port: 9882

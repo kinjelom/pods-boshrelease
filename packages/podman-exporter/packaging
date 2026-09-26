@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -eux
+
+source meta-info/blobs-versions.env
+
+# Extract prometheus-podman-exporter source (contains vendor/, no network needed)
+tar xzf "${BOSH_COMPILE_TARGET}/podman-exporter/prometheus-podman-exporter-${PODMAN_EXPORTER_VERSION}.src.tar.gz"
+
+# shellcheck disable=SC1090
+source /var/vcap/packages/golang-*-linux/bosh/compile.env
+mkdir -p "${BOSH_INSTALL_TARGET}/bin"
+
+# Local (libpod) mode: reads podman's state directly, no podman API service needed.
+# cgo is required by libpod (shm locks); only libc is linked with these tags.
+export CGO_ENABLED=1 GOFLAGS=-mod=vendor GOTOOLCHAIN=local
+BUILD_TAGS="containers_image_openpgp exclude_graphdriver_btrfs"
+LDFLAGS="-X github.com/containers/prometheus-podman-exporter/cmd.buildVersion=${PODMAN_EXPORTER_VERSION}"
+
+pushd "prometheus-podman-exporter-${PODMAN_EXPORTER_VERSION}"
+  # retry once: a transient compiler crash was observed on a 32-core build host
+  go build -tags "${BUILD_TAGS}" -ldflags "${LDFLAGS}" -o "${BOSH_INSTALL_TARGET}/bin/prometheus-podman-exporter" . ||
+    go build -tags "${BUILD_TAGS}" -ldflags "${LDFLAGS}" -o "${BOSH_INSTALL_TARGET}/bin/prometheus-podman-exporter" .
+popd
+
+# upstream exits 1 after printing the version, so check the output instead
+"${BOSH_INSTALL_TARGET}/bin/prometheus-podman-exporter" --version 2>&1 | grep -F "version=${PODMAN_EXPORTER_VERSION}"

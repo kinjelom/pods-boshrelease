@@ -1,0 +1,95 @@
+---
+name: pods
+
+description: |
+  Runs workloads described with Kubernetes YAML (Pod, Deployment, DaemonSet + ConfigMap, Secret,
+  PersistentVolumeClaim) using `podman kube play` - no Kubernetes control plane involved.
+  Every definition is a separate monit process (`pod-<name>`), container output goes to
+  /var/vcap/sys/log/pods/<name>/<container>.log. Requires the `podman` job on the same instance.
+
+templates:
+  bin/pre-start.sh.erb: bin/pre-start
+  bin/post-start.sh.erb: bin/post-start
+  bin/pods-env.sh: bin/pods-env.sh
+  bin/pod-ctl.sh: bin/pod-ctl
+  bin/pod-supervisor.sh: bin/pod-supervisor
+
+packages:
+- podman
+- common
+
+properties:
+  pods.definitions:
+    description: |
+      Map of pod definitions keyed by name ([a-z0-9-], used for the monit process `pod-<name>`
+      and the log directory). Keys of a definition:
+        manifest:        (required) Kubernetes YAML: a hash (one document), a list of hashes
+                         (documents) or a multi-document string (e.g. `helm template` output).
+                         Supported kinds: Pod, Deployment and DaemonSet (1 replica),
+                         ConfigMap, Secret, PersistentVolumeClaim. Other kinds (Service, Ingress,
+                         ServiceAccount, ...) are dropped and listed in the rendered file header.
+        depends_on:      names of other definitions started before this one (monit dependency)
+        start_timeout:   seconds post-start waits for the pods to be running (and healthy)
+        stop_timeout:    seconds granted for a graceful teardown
+        play_flags:      extra `podman kube play` flags, e.g. ["--network", "host"]
+        follow_logs:     copy container output to /var/vcap/sys/log/pods/<name>/<container>.log
+        wait_healthy:    post-start also waits for containers with probes to become healthy
+        fix_host_path_ownership: create hostPath directories and chown them (see pods.host_paths)
+        host_path_owners: explicit owners, e.g. { /var/vcap/store/app: "1000:1000" }
+        monit_additional_entries: extra monit lines for this process (monit 5.2.5 syntax)
+      Persistent data: prefer hostPath volumes under /var/vcap/store/<something>; PVCs become podman
+      named volumes under podman.data_dir and survive restarts and redeploys (never deleted by this job).
+    default: {}
+    example:
+      redis:
+        manifest:
+        - apiVersion: v1
+          kind: Pod
+          metadata: { name: redis }
+          spec:
+            restartPolicy: Always
+            containers:
+            - name: redis
+              image: docker.io/library/redis:7
+              ports: [{ containerPort: 6379, hostPort: 6379 }]
+              volumeMounts: [{ name: data, mountPath: /data }]
+            volumes:
+            - { name: data, hostPath: { path: /var/vcap/store/redis, type: DirectoryOrCreate } }
+
+  pods.defaults.start_timeout:
+    description: "Default `start_timeout` of a definition (includes image pulls)"
+    default: 300
+  pods.defaults.stop_timeout:
+    description: "Default `stop_timeout` of a definition"
+    default: 60
+  pods.defaults.play_flags:
+    description: "Default `play_flags` of a definition"
+    default: []
+  pods.defaults.follow_logs:
+    description: "Default `follow_logs` of a definition"
+    default: true
+  pods.defaults.wait_healthy:
+    description: "Default `wait_healthy` of a definition"
+    default: true
+
+  pods.defaults.fix_host_path_ownership:
+    description: |
+      Default `fix_host_path_ownership` of a definition. Before every start the supervisor creates hostPath
+      directories (type DirectoryOrCreate) and, when a container mounting one read-write declares
+      securityContext.runAsUser (container or pod level; group: runAsGroup, then fsGroup, then the uid),
+      runs `chown -R uid:gid` on it - only when the directory's current owner differs.
+      Images with a non-root USER (e.g. 13001) just need `securityContext: { runAsUser: 13001, runAsGroup: 13001 }`.
+    default: true
+
+  pods.host_paths.allowed_prefixes:
+    description: |
+      hostPath directories are only ever created/chowned below these prefixes (never the prefix itself,
+      symlinks are resolved and checked again at runtime). Other hostPaths are mounted untouched.
+    default:
+    - /var/vcap/store/
+    - /var/vcap/data/
+    - /var/vcap/sys/log/
+
+  pods.supervisor.poll_interval:
+    description: "Seconds between pod state / container log checks of the supervisor"
+    default: 5

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# monit start/stop program of the podman exporter
+set -euo pipefail
+
+RUN_DIR=/var/vcap/sys/run/podman-exporter
+LOG_DIR=/var/vcap/sys/log/podman-exporter
+PID_FILE="$RUN_DIR/podman-exporter.pid"
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+exec 1>> "$LOG_DIR/ctl.stdout.log"
+exec 2>> "$LOG_DIR/ctl.stderr.log"
+source /var/vcap/packages/common/script_utils.sh
+
+if [[ ! -f /var/vcap/jobs/podman/bin/podman-env.sh ]]; then
+  log_error "the podman-exporter job requires the podman job on the same instance group"
+  exit 1
+fi
+# podman configuration comes from /etc/containers (linked by the podman job)
+source /var/vcap/jobs/podman/bin/podman-env.sh
+
+<%
+  require 'shellwords'
+
+  known_collectors = %w(pod volume image network system)
+  collectors = Array(p("podman_exporter.collectors")).map(&:to_s)
+  unknown = collectors - known_collectors
+  raise "podman_exporter.collectors: unknown #{unknown.inspect}, valid: #{known_collectors.inspect}" unless unknown.empty?
+
+  args = ["--web.listen-address=#{p("podman_exporter.bind_address")}:#{p("podman_exporter.port")}",
+          "--web.telemetry-path=#{p("podman_exporter.telemetry_path")}",
+          "--web.max-requests=#{p("podman_exporter.max_requests")}",
+          "--collector.cache-duration=#{p("podman_exporter.cache_duration")}",
+          "--collector.container-stats-timeout=#{p("podman_exporter.container_stats_timeout")}"]
+  args += collectors.map { |c| "--collector.#{c}" }
+  if p("podman_exporter.store_labels")
+    args << "--collector.store-labels"
+  elsif !p("podman_exporter.whitelisted_labels").empty?
+    args << "--collector.whitelisted-labels=#{p("podman_exporter.whitelisted_labels").join(",")}"
+  end
+  args << "--collector.enhance-metrics" if p("podman_exporter.enhance_metrics")
+  args << "--web.disable-exporter-metrics" if p("podman_exporter.disable_exporter_metrics")
+  args << "--debug" if p("podman_exporter.debug")
+  args += Array(p("podman_exporter.extra_args")).map(&:to_s)
+-%>
+ARGS=(<%= args.map { |a| Shellwords.escape(a) }.join(" ") %>)
+
+function pid_alive() {
+  [[ -n "${1:-}" ]] && kill -0 "$1" 2> /dev/null
+}
+
+case ${1:-} in
+  start)
+    if pid_alive "$(cat "$PID_FILE" 2> /dev/null || true)"; then
+      log_info "podman-exporter is already running"
+      exit 0
+    fi
+    log_info "starting podman-exporter ${ARGS[*]}"
+    setsid /var/vcap/packages/podman-exporter/bin/prometheus-podman-exporter "${ARGS[@]}" \
+      >> "$LOG_DIR/podman-exporter.stdout.log" 2>> "$LOG_DIR/podman-exporter.stderr.log" < /dev/null &
+    echo $! > "$PID_FILE"
+    ;;
+
+  stop)
+    pid=$(cat "$PID_FILE" 2> /dev/null || true)
+    if pid_alive "$pid"; then
+      log_info "stopping podman-exporter (pid $pid)"
+      # graceful stop only: a podman library process killed while holding a lock leaks that lock
+      kill -TERM "$pid"
+      for ((i = 0; i < 45; i++)); do
+        pid_alive "$pid" || break
+        sleep 1
+      done
+      if pid_alive "$pid"; then
+        log_warn "podman-exporter did not stop within 45s, killing it"
+        kill -KILL "$pid" || true
+      fi
+    fi
+    rm -f "$PID_FILE"
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop}" >&2
+    exit 1
+    ;;
+esac

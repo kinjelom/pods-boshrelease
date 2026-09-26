@@ -1,0 +1,103 @@
+---
+name: ((deployment_name))
+
+instance_groups:
+  - name: pods
+    azs: ((azs))
+    instances: ((instances))
+    vm_type: default
+    stemcell: default
+    persistent_disk: 10240
+    networks: [ name: default ]
+    jobs:
+      - name: podman
+        release: pods
+        properties:
+          podman:
+            registries:
+              unqualified_search: [ docker.io ]
+      - name: podman-exporter
+        release: pods
+        tags:
+          prometheus_exporter_port: ((pods_exporter_port))
+        properties:
+          podman_exporter:
+            port: ((pods_exporter_port))
+            whitelisted_labels: [ app ]
+      - name: pods
+        release: pods
+        properties:
+          pods:
+            definitions:
+              redis:
+                manifest:
+                  - apiVersion: v1
+                    kind: ConfigMap
+                    metadata: { name: redis-conf }
+                    data:
+                      redis.conf: |
+                        appendonly yes
+                        dir /data
+                  - apiVersion: v1
+                    kind: Pod
+                    metadata: { name: redis, labels: { app: redis } }
+                    spec:
+                      restartPolicy: Always
+                      terminationGracePeriodSeconds: 20
+                      containers:
+                        - name: redis
+                          image: docker.io/library/redis:7
+                          args: [ "/etc/redis/redis.conf" ]
+                          ports: [ { containerPort: 6379, hostPort: 6379 } ]
+                          resources: { limits: { memory: 256Mi } }
+                          livenessProbe:
+                            exec: { command: [ redis-cli, ping ] }
+                            periodSeconds: 10
+                          volumeMounts:
+                            - { name: data, mountPath: /data }
+                            - { name: conf, mountPath: /etc/redis }
+                      volumes:
+                        - { name: data, hostPath: { path: /var/vcap/store/redis, type: DirectoryOrCreate } }
+                        - { name: conf, configMap: { name: redis-conf } }
+
+              web:
+                depends_on: [ redis ]
+                # e.g. `helm template` / `kustomize build` output pasted as a string; Service objects are dropped
+                manifest: |
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata: { name: web }
+                  spec:
+                    replicas: 1
+                    template:
+                      metadata: { labels: { app: web } }
+                      spec:
+                        containers:
+                        - name: nginx
+                          image: docker.io/library/nginx:1.27
+                          ports: [{ containerPort: 80, hostPort: 8080 }]
+                          livenessProbe:
+                            httpGet: { path: /, port: 80 }
+                            periodSeconds: 10
+                  ---
+                  apiVersion: v1
+                  kind: Service
+                  metadata: { name: web }
+                  spec: { ports: [{ port: 80 }] }
+
+
+releases:
+  - name: pods
+    version: latest
+
+stemcells:
+  - alias: default
+    os: ubuntu-noble
+    version: latest
+
+update:
+  canaries: 1
+  canary_watch_time: 30000-600000
+  max_in_flight: 1
+  serial: false
+  update_watch_time: 5000-600000

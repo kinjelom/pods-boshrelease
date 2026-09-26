@@ -1,0 +1,92 @@
+<%
+  # ---- shared helpers (identical in containers.conf.erb, storage.conf.erb, registries.conf.erb) ----
+  require 'json'
+
+  # Deep merge: hashes are merged recursively, other values replace, nil removes the key.
+  deep_merge = lambda do |base, over|
+    result = base.dup
+    (over || {}).each do |key, value|
+      key = key.to_s
+      if value.nil?
+        result.delete(key)
+      elsif value.is_a?(Hash) && result[key].is_a?(Hash)
+        result[key] = deep_merge.call(result[key], value)
+      else
+        result[key] = value
+      end
+    end
+    result
+  end
+
+  toml_key = lambda { |k| k.to_s =~ /\A[A-Za-z0-9_-]+\z/ ? k.to_s : k.to_s.to_json }
+  toml_value = lambda do |v|
+    case v
+    when String then v.to_json
+    when Integer, Float, TrueClass, FalseClass then v.to_s
+    when Array then "[" + v.map { |x| toml_value.call(x) }.join(", ") + "]"
+    when Hash then "{ " + v.map { |k, x| "#{toml_key.call(k)} = #{toml_value.call(x)}" }.join(", ") + " }"
+    else raise "unsupported TOML value: #{v.inspect}"
+    end
+  end
+  table_array = lambda { |v| v.is_a?(Array) && !v.empty? && v.all? { |x| x.is_a?(Hash) } }
+  toml_emit = lambda do |hash, path, out|
+    hash.each do |k, v|
+      next if v.nil? || v.is_a?(Hash) || table_array.call(v)
+      out << "#{toml_key.call(k)} = #{toml_value.call(v)}"
+    end
+    hash.each do |k, v|
+      full = path + [toml_key.call(k)]
+      if v.is_a?(Hash)
+        out << "" << "[#{full.join(".")}]"
+        toml_emit.call(v, full, out)
+      elsif table_array.call(v)
+        v.each do |item|
+          out << "" << "[[#{full.join(".")}]]"
+          toml_emit.call(item, full, out)
+        end
+      end
+    end
+    out
+  end
+
+  data_dir = p("podman.data_dir", "").to_s
+  data_dir = (spec.persistent_disk.to_i > 0 ? "/var/vcap/store/podman" : "/var/vcap/data/podman") if data_dir.empty?
+  # ---- end of shared helpers ----
+-%>
+<%
+  pkg = "/var/vcap/packages/podman"
+  generated = {
+    "containers" => {
+      "log_driver" => "k8s-file",
+      "log_size_max" => p("podman.containers.log_size_max"),
+      "seccomp_profile" => "#{pkg}/share/containers/seccomp.json",
+    },
+    "engine" => {
+      # processes are supervised by monit, not systemd
+      "cgroup_manager" => "cgroupfs",
+      "events_logger" => "file",
+      "events_logfile_path" => "/var/vcap/sys/log/podman/events.log",
+      "helper_binaries_dir" => ["#{pkg}/lib/podman", "#{pkg}/bin"],
+      "conmon_path" => ["#{pkg}/lib/podman/conmon"],
+      "runtime" => p("podman.engine.runtime"),
+      # must be a tmpfs: /var/vcap/sys/run -> /var/vcap/data/sys/run
+      "tmp_dir" => "/var/vcap/sys/run/podman/libpod",
+      "image_copy_tmp_dir" => "#{data_dir}/tmp",
+      "runtimes" => {
+        "crun" => ["#{pkg}/bin/crun"],
+        "runc" => ["#{pkg}/bin/runc"],
+      },
+    },
+    "network" => {
+      "network_config_dir" => "#{data_dir}/networks",
+      "default_subnet" => p("podman.network.default_subnet"),
+    },
+  }
+  firewall_driver = p("podman.network.firewall_driver", "").to_s
+  generated["network"]["firewall_driver"] = firewall_driver unless firewall_driver.empty?
+
+  config = deep_merge.call(generated, p("podman.raw_config.containers_conf", {}))
+-%>
+# Rendered by the podman job (pods-boshrelease). Changes are lost on the next deploy,
+# use the `podman.raw_config.containers_conf` property instead.
+<%= toml_emit.call(config, [], []).join("\n") %>

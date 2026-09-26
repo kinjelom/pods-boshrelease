@@ -1,0 +1,9 @@
+---
+name: podman-exporter
+
+dependencies:
+- golang-1.27-linux
+
+files:
+- meta-info/blobs-versions.env
+- podman-exporter/prometheus-podman-exporter-*.src.tar.gz

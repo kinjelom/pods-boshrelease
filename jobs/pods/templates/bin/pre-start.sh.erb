@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_DIR=/var/vcap/sys/log/pods
+mkdir -p "$LOG_DIR"
+
+SCRIPT_NAME=$(basename "$0")
+exec 1>> "${LOG_DIR}/${SCRIPT_NAME}.stdout.log"
+exec 2>> "${LOG_DIR}/${SCRIPT_NAME}.stderr.log"
+source /var/vcap/packages/common/script_utils.sh
+
+log_info "--- ${SCRIPT_NAME} begin"
+
+if [[ ! -f /var/vcap/jobs/podman/bin/podman-env.sh ]]; then
+  log_error "the pods job requires the podman job on the same instance group"
+  exit 1
+fi
+source /var/vcap/jobs/pods/bin/pods-env.sh
+
+<%
+  require 'yaml'
+  require 'base64'
+  require 'shellwords'
+
+  pod_kinds = %w(Pod Deployment DaemonSet)
+  supported_kinds = pod_kinds + %w(ConfigMap Secret PersistentVolumeClaim)
+
+  bash_array = lambda { |values| "(" + Array(values).map { |v| Shellwords.escape(v.to_s) }.join(" ") + ")" }
+  setting = lambda { |definition, key| definition.key?(key) ? definition[key] : p("pods.defaults.#{key}") }
+
+  host_path_prefixes = Array(p("pods.host_paths.allowed_prefixes")).map { |prefix| prefix.to_s.end_with?("/") ? prefix.to_s : "#{prefix}/" }
+  # below an allowed prefix (never the prefix itself) and without ".." components
+  allowed_host_path = lambda do |path|
+    host_path_prefixes.any? { |prefix| path.start_with?(prefix) && path.length > prefix.length } && !path.split("/").include?("..")
+  end
+
+  definitions = (p("pods.definitions", {}) || {}).map do |name, definition|
+    where = "pods.definitions.#{name}"
+    raise "#{where}: invalid name, use [a-z0-9-] (max 50 characters)" unless name =~ /\A[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?\z/
+    raise "#{where}: must be a hash" unless definition.is_a?(Hash)
+
+    manifest = definition["manifest"]
+    documents =
+      case manifest
+      when String then YAML.load_stream(manifest)
+      when Hash then [manifest]
+      when Array then manifest
+      else raise "#{where}.manifest: required (hash, list of hashes or YAML string)"
+      end
+    documents = documents.compact
+    documents.each_with_index do |doc, i|
+      raise "#{where}.manifest[#{i}]: not a Kubernetes object (kind/metadata.name missing)" unless
+        doc.is_a?(Hash) && doc["kind"] && doc.dig("metadata", "name")
+    end
+
+    kept, dropped = documents.partition { |doc| supported_kinds.include?(doc["kind"]) }
+
+    pods = kept.select { |doc| pod_kinds.include?(doc["kind"]) }.map do |doc|
+      object = "#{doc["kind"]}/#{doc["metadata"]["name"]}"
+      if doc["kind"] == "Deployment"
+        replicas = doc.dig("spec", "replicas") || 1
+        raise "#{where}: #{object} has #{replicas} replicas, podman supports exactly 1" unless replicas.to_i == 1
+      end
+      # podman names the pod of a Deployment/DaemonSet "<name>-pod"
+      doc["kind"] == "Pod" ? doc["metadata"]["name"] : "#{doc["metadata"]["name"]}-pod"
+    end
+    raise "#{where}: the manifest contains no Pod, Deployment or DaemonSet" if pods.empty?
+    raise "#{where}: duplicate pod names #{pods.inspect}" if pods.uniq.size != pods.size
+
+    # hostPath directory ownership, applied by the supervisor before every `kube play`: the owner comes from
+    # runAsUser/runAsGroup of the (init)containers mounting the directory read-write, or from host_path_owners.
+    # Only paths below pods.host_paths.allowed_prefixes are ever touched.
+    explicit_owners = (definition["host_path_owners"] || {}).map { |path, owner| [path.to_s.chomp("/"), owner.to_s] }.to_h
+    owners = {} # path => { "owner" => "uid:gid", "create" => bool, "from" => container }
+    if setting.call(definition, "fix_host_path_ownership")
+      kept.select { |doc| pod_kinds.include?(doc["kind"]) }.each do |doc|
+        spec = doc["kind"] == "Pod" ? doc["spec"] : doc.dig("spec", "template", "spec")
+        next unless spec.is_a?(Hash)
+        host_paths = {}
+        Array(spec["volumes"]).each do |volume|
+          host_path = volume["hostPath"]
+          next unless host_path.is_a?(Hash) && ["", "Directory", "DirectoryOrCreate"].include?(host_path["type"].to_s)
+          host_paths[volume["name"]] = { "path" => host_path["path"].to_s.chomp("/"), "create" => host_path["type"] == "DirectoryOrCreate" }
+        end
+        pod_context = spec["securityContext"] || {}
+        (Array(spec["initContainers"]) + Array(spec["containers"])).each do |container|
+          context = container["securityContext"] || {}
+          uid = context["runAsUser"] || pod_context["runAsUser"]
+          next if uid.nil?
+          gid = context["runAsGroup"] || pod_context["runAsGroup"] || pod_context["fsGroup"] || uid
+          owner = "#{Integer(uid)}:#{Integer(gid)}"
+          Array(container["volumeMounts"]).each do |mount|
+            host_path = host_paths[mount["name"]]
+            next if mount["readOnly"] || host_path.nil? || !allowed_host_path.call(host_path["path"])
+            path = host_path["path"]
+            if owners[path] && owners[path]["owner"] != owner && !explicit_owners.key?(path)
+              raise "#{where}: hostPath #{path} is mounted by containers running as #{owners[path]["owner"]} (#{owners[path]["from"]}) " \
+                    "and #{owner} (#{container["name"]}), choose one with host_path_owners"
+            end
+            owners[path] = { "owner" => owner, "create" => host_path["create"], "from" => container["name"] }
+          end
+        end
+      end
+    end
+    explicit_owners.each do |path, owner|
+      raise "#{where}.host_path_owners: #{path} is not below #{host_path_prefixes.join(", ")}" unless allowed_host_path.call(path)
+      raise "#{where}.host_path_owners.#{path}: \"#{owner}\" is not \"uid:gid\"" unless owner =~ /\A\d+:\d+\z/
+      owners[path] = { "owner" => owner, "create" => true, "from" => "host_path_owners" }
+    end
+
+    header = ["# pods-boshrelease definition: #{name}"]
+    header << "# dropped (unsupported by podman kube play): " + dropped.map { |d| "#{d["kind"]}/#{d["metadata"]["name"]}" }.join(", ") unless dropped.empty?
+    kube = header.join("\n") + "\n" + kept.map(&:to_yaml).join
+
+    env = <<~ENV
+      POD_NAMES=#{bash_array.call(pods)}
+      PLAY_FLAGS=#{bash_array.call(setting.call(definition, "play_flags"))}
+      FOLLOW_LOGS=#{Shellwords.escape(setting.call(definition, "follow_logs").to_s)}
+      WAIT_HEALTHY=#{Shellwords.escape(setting.call(definition, "wait_healthy").to_s)}
+      START_TIMEOUT=#{Integer(setting.call(definition, "start_timeout"))}
+      STOP_TIMEOUT=#{Integer(setting.call(definition, "stop_timeout"))}
+      POLL_INTERVAL=#{Integer(p("pods.supervisor.poll_interval"))}
+      HOST_PATH_OWNERS=#{bash_array.call(owners.map { |path, o| "#{path}|#{o["owner"]}|#{o["create"]}" })}
+      HOST_PATH_PREFIXES=#{bash_array.call(host_path_prefixes)}
+    ENV
+
+    { "name" => name, "kube" => kube, "env" => env, "pods" => pods, "dropped" => dropped.size, "owners" => owners }
+  end
+-%>
+mkdir -p "$PODS_DEFS_DIR" "$PODS_RUN_DIR"
+chmod 0700 "$(dirname "$PODS_DEFS_DIR")" "$PODS_DEFS_DIR"
+
+# write_definition <name> <kube.yml base64> <definition.env base64>
+write_definition() {
+  local dir="$PODS_DEFS_DIR/$1"
+  mkdir -p "$dir" "$PODS_LOG_ROOT/$1"
+  chmod 0700 "$dir"
+  # manifests may contain Secrets
+  (umask 077 && echo "$2" | base64 -d > "$dir/kube.yml.new" && echo "$3" | base64 -d > "$dir/definition.env.new")
+  mv -f "$dir/kube.yml.new" "$dir/kube.yml"
+  mv -f "$dir/definition.env.new" "$dir/definition.env"
+}
+
+DEFINITIONS=(<%= definitions.map { |d| d["name"] }.join(" ") %>)
+
+<% definitions.each do |d| -%>
+log_info "definition '<%= d["name"] %>': pods <%= d["pods"].join(", ") %><%= d["dropped"] > 0 ? " (#{d["dropped"]} unsupported object(s) dropped, see kube.yml header)" : "" %>"
+<% d["owners"].each do |path, o| -%>
+log_info <%= Shellwords.escape("definition '#{d["name"]}': hostPath #{path} owned by #{o["owner"]} (#{o["from"]})") %>
+<% end -%>
+write_definition <%= d["name"] %> \
+  '<%= Base64.strict_encode64(d["kube"]) %>' \
+  '<%= Base64.strict_encode64(d["env"]) %>'
+
+<% end -%>
+# Remove definitions that are no longer part of the deployment
+# (their monit processes were already stopped by BOSH, `kube down` is a safety net; volumes are kept)
+shopt -s nullglob
+for dir in "$PODS_DEFS_DIR"/*/; do
+  name=$(basename "$dir")
+  if [[ " ${DEFINITIONS[*]} " != *" $name "* ]]; then
+    log_info "removing definition '$name' (no longer in the manifest)"
+    podman kube down "$dir/kube.yml" || log_warn "kube down of '$name' failed"
+    rm -rf "$dir"
+  fi
+done
+
+log_info "--- ${SCRIPT_NAME} success"

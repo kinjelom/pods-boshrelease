@@ -1,0 +1,8 @@
+podman-exporter/prometheus-podman-exporter-2.0.0.src.tar.gz:
+  size: 14210056
+  object_id: a2adb80f-dfb6-45b2-7ec4-8ca28dd5c507
+  sha: sha256:3aaedf7d77732ab91f8ad658e8c1474f2b50d80e815e7cae1c675e921ea907e2
+podman/podman-static-6.1.2-linux-amd64.tar.gz:
+  size: 35104638
+  object_id: 442792c9-0346-41ee-52a6-0bc4852914b8
+  sha: sha256:481b6f5a57919aea837b54df1eaa6a5b968df505eedbdd78356e80306af676f1

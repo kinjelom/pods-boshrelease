@@ -1,0 +1,7 @@
+name: pods
+blobstore:
+  provider: s3
+  options:
+    bucket_name: boshreleases
+    folder_name: pods
+

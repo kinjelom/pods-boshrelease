@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_DIR=/var/vcap/sys/log/podman
+mkdir -p "$LOG_DIR"
+
+SCRIPT_NAME=$(basename "$0")
+exec 1>> "${LOG_DIR}/${SCRIPT_NAME}.stdout.log"
+exec 2>> "${LOG_DIR}/${SCRIPT_NAME}.stderr.log"
+source /var/vcap/packages/common/script_utils.sh
+
+log_info "--- ${SCRIPT_NAME} begin"
+
+<%
+  data_dir = p("podman.data_dir", "").to_s
+  data_dir = (spec.persistent_disk.to_i > 0 ? "/var/vcap/store/podman" : "/var/vcap/data/podman") if data_dir.empty?
+-%>
+JOB_DIR=/var/vcap/jobs/podman
+PKG_DIR=/var/vcap/packages/podman
+DATA_DIR="<%= data_dir %>"
+
+log_info "podman package: $(cat "$PKG_DIR/VERSION"), data dir: $DATA_DIR"
+
+# Podman 6 supports the unified cgroup v2 hierarchy only. Jammy stemcells boot with cgroup v1 (hybrid),
+# Noble stemcells with cgroup v2: fail the deploy with a clear message instead of podman's own
+# "Cgroups v1 not supported" at the first container start.
+CGROUP_FS=$(stat -fc %T /sys/fs/cgroup)
+if [[ "$CGROUP_FS" != "cgroup2fs" ]]; then
+  log_error "cgroup v2 (unified hierarchy) is required by podman $(cat "$PKG_DIR/VERSION"), but /sys/fs/cgroup is" \
+    "'$CGROUP_FS' (cgroup v1/hybrid): use an ubuntu-noble stemcell"
+  exit 1
+fi
+
+mkdir -p "$DATA_DIR/storage" "$DATA_DIR/networks" "$DATA_DIR/tmp" /var/vcap/sys/run/podman
+chmod 0700 "$DATA_DIR"
+chmod 0600 "$JOB_DIR/config/auth.json"
+
+# Podman is also executed outside of BOSH scripts: conmon exit commands (cleanup, restart policy)
+# and operators (`bosh ssh`). Linking the rendered configuration
+# into the default locations makes every invocation use the same storage, network and registries.
+mkdir -p /etc/containers
+for file in containers.conf storage.conf registries.conf policy.json; do
+  ln -sfn "$JOB_DIR/config/$file" "/etc/containers/$file"
+done
+ln -sfn "$PKG_DIR/bin/podman" /usr/local/bin/podman
+
+<% if p("podman.shell_profile") -%>
+cat > /etc/profile.d/podman-bosh.sh << 'EOF'
+source /var/vcap/jobs/podman/bin/podman-env.sh
+if [ -n "${BASH_VERSION:-}" ] && [ -f /var/vcap/packages/podman/share/podman.bash-completion ]; then
+  source /var/vcap/packages/podman/share/podman.bash-completion
+fi
+EOF
+<% else -%>
+rm -f /etc/profile.d/podman-bosh.sh
+<% end -%>
+
+<% if p("podman.network.firewall_driver", "").to_s != "none" -%>
+if ! command -v nft > /dev/null 2>&1; then
+  log_warn "nft binary not found: netavark bridge networking (nftables firewall driver) will fail;" \
+    "use hostNetwork pods or set podman.network.firewall_driver: none"
+fi
+<% end -%>
+
+# Validate the configuration early (fails the deploy instead of the first pod start)
+source "$JOB_DIR/bin/podman-env.sh"
+podman info --format 'podman {{.Version.Version}}, runtime {{.Host.OCIRuntime.Name}}, cgroups {{.Host.CgroupsVersion}} ({{.Host.CgroupManager}}), storage {{.Store.GraphDriverName}} at {{.Store.GraphRoot}}' \
+  | while read -r line; do log_info "$line"; done
+
+log_info "--- ${SCRIPT_NAME} success"

@@ -1,0 +1,118 @@
+---
+name: podman
+
+description: |
+  Podman container engine (daemonless). This job runs no process of its own: it renders the
+  engine configuration (containers.conf, storage.conf, registries.conf, policy.json, auth.json),
+  links it into /etc/containers and exposes `/var/vcap/jobs/podman/bin/podman`.
+  Colocate the `pods` job to run workloads described with Kubernetes YAML.
+
+templates:
+  bin/pre-start.sh.erb: bin/pre-start
+  bin/podman-env.sh: bin/podman-env.sh
+  bin/podman.sh: bin/podman
+
+  config/containers.conf.erb: config/containers.conf
+  config/storage.conf.erb: config/storage.conf
+  config/registries.conf.erb: config/registries.conf
+  config/policy.json.erb: config/policy.json
+  config/auth.json.erb: config/auth.json
+
+packages:
+- podman
+- common
+
+properties:
+  podman.data_dir:
+    description: |
+      Root directory for images, containers, named volumes (PVCs) and network definitions.
+      Empty means: /var/vcap/store/podman when the instance has a persistent disk,
+      otherwise /var/vcap/data/podman (ephemeral disk).
+    default: ""
+
+  podman.storage.driver:
+    description: "containers-storage driver"
+    default: "overlay"
+
+  podman.containers.log_size_max:
+    description: |
+      Maximum size (bytes) of a container's internal k8s-file log (kept by podman in its storage).
+      The `pods` job copies container output to /var/vcap/sys/log, where BOSH logrotate takes over.
+      Must be >= 8192 or -1 (unlimited).
+    default: 10485760
+
+  podman.engine.runtime:
+    description: "OCI runtime: crun or runc (both are shipped in the podman package)"
+    default: "crun"
+
+  podman.network.default_subnet:
+    description: "Subnet of the default `podman` bridge network"
+    default: "10.88.0.0/16"
+
+  podman.network.firewall_driver:
+    description: |
+      Netavark firewall driver: "" (auto), "nftables" or "none". The nftables driver needs the `nft`
+      binary on the stemcell; "none" is fine when all pods use `hostNetwork: true`.
+    default: ""
+
+  podman.registries.unqualified_search:
+    description: |
+      Registries tried for short image names (e.g. `redis:7`). A single entry keeps Docker-like,
+      unambiguous behaviour.
+    default: [docker.io]
+
+  podman.registries.insecure:
+    description: "Registries (host[:port][/path]) reachable over plain HTTP or with unverifiable TLS"
+    default: []
+    example: [registry.local:5000]
+
+  podman.registries.mirrors:
+    description: |
+      Registry mirrors, keyed by the registry prefix. Values are lists of mirror locations
+      (strings) or registries.conf mirror tables (hashes, e.g. with `insecure: true`).
+    default: {}
+    example:
+      docker.io:
+      - mirror.example.com/dockerhub
+      - { location: "mirror.local:5000", insecure: true }
+
+  podman.registries.auth:
+    description: "Registry credentials, keyed by registry host, rendered into auth.json"
+    default: {}
+    example:
+      registry.example.com:
+        username: ci
+        password: ((registry_password))
+
+  podman.registries.policy:
+    description: "Image signature policy (policy.json content)"
+    default:
+      default:
+      - type: insecureAcceptAnything
+
+  podman.raw_config.containers_conf:
+    description: |
+      Raw containers.conf content (as a hash of TOML tables), deep-merged over the generated
+      configuration. Hashes are merged recursively, other values replace the generated ones,
+      `null` removes a generated key.
+    default: {}
+    example:
+      containers:
+        pids_limit: 4096
+      network:
+        default_subnet_pools:
+        - { base: "10.89.0.0/16", size: 24 }
+
+  podman.raw_config.storage_conf:
+    description: "Raw storage.conf content, deep-merged over the generated configuration (same rules as containers_conf)"
+    default: {}
+
+  podman.raw_config.registries_conf:
+    description: |
+      Raw registries.conf content, deep-merged over the generated configuration (same rules as
+      containers_conf). Note: a `registry` list given here replaces the generated one.
+    default: {}
+
+  podman.shell_profile:
+    description: "Install /etc/profile.d/podman-bosh.sh (PATH, auth file, bash completion) for operators using `bosh ssh`"
+    default: true

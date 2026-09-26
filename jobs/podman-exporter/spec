@@ -1,0 +1,66 @@
+---
+name: podman-exporter
+
+description: |
+  Prometheus exporter for podman (github.com/containers/prometheus-podman-exporter) in local mode:
+  reads the podman state directly (libpod), no podman API service needed. Metrics of containers,
+  pods, images, volumes, networks and podman itself. Requires the `podman` job on the same instance.
+
+templates:
+  bin/ctl.sh.erb: bin/ctl
+
+packages:
+- podman-exporter
+- common
+
+provides:
+- name: podman-exporter
+  type: podman-exporter
+  properties:
+  - podman_exporter.port
+  - podman_exporter.telemetry_path
+
+properties:
+  podman_exporter.bind_address:
+    description: "Address to listen on (empty = all interfaces)"
+    default: ""
+  podman_exporter.port:
+    description: "Port of the metrics endpoint"
+    default: 9882
+  podman_exporter.telemetry_path:
+    description: "Path of the metrics endpoint"
+    default: "/metrics"
+
+  podman_exporter.collectors:
+    description: |
+      Collectors enabled in addition to the always-on `container` collector:
+      pod, volume, image, network, system
+    default: [pod, volume, image, network, system]
+  podman_exporter.store_labels:
+    description: "Convert all pod/container/image labels to metric labels"
+    default: false
+  podman_exporter.whitelisted_labels:
+    description: "Labels converted to metric labels (only when store_labels is false)"
+    default: []
+    example: [app, app.kubernetes.io/name]
+  podman_exporter.enhance_metrics:
+    description: "Add the fields of the podman_<...>_info metrics to all metrics (name, pod_name, image, ...)"
+    default: true
+  podman_exporter.cache_duration:
+    description: "Cache duration of container/image sizes"
+    default: "1h"
+  podman_exporter.container_stats_timeout:
+    description: "Timeout of collecting container statistics"
+    default: "5s"
+  podman_exporter.max_requests:
+    description: "Maximum number of parallel scrape requests (0 = unlimited)"
+    default: 4
+  podman_exporter.disable_exporter_metrics:
+    description: "Exclude metrics about the exporter itself (promhttp_*, process_*, go_*)"
+    default: false
+  podman_exporter.debug:
+    description: "Debug logging"
+    default: false
+  podman_exporter.extra_args:
+    description: "Additional command line arguments"
+    default: []

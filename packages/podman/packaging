@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+set -eux
+
+source meta-info/blobs-versions.env
+
+# Extract the static Podman bundle
+tar xzf "${BOSH_COMPILE_TARGET}/podman/podman-static-${PODMAN_STATIC_VERSION}-linux-amd64.tar.gz"
+SRC="podman-linux-amd64"
+
+mkdir -p "${BOSH_INSTALL_TARGET}/bin" "${BOSH_INSTALL_TARGET}/lib/podman" "${BOSH_INSTALL_TARGET}/share/containers"
+
+# CLI + OCI runtimes + rootless helpers (pasta, fuse-overlayfs)
+cp -a "${SRC}/usr/local/bin/." "${BOSH_INSTALL_TARGET}/bin/"
+# conmon, netavark, aardvark-dns, catatonit, rootlessport
+cp -a "${SRC}/usr/local/lib/podman/." "${BOSH_INSTALL_TARGET}/lib/podman/"
+# Default seccomp profile (referenced from containers.conf)
+cp -a "${SRC}/etc/containers/seccomp.json" "${BOSH_INSTALL_TARGET}/share/containers/seccomp.json"
+# Bash completion for operators
+cp -a "${SRC}/usr/local/share/bash-completion/completions/podman" "${BOSH_INSTALL_TARGET}/share/podman.bash-completion"
+
+# systemd units, quadlet and the bundle's /etc defaults are intentionally skipped:
+# processes are supervised by monit and configuration is rendered by the podman job.
+
+echo "${PODMAN_STATIC_VERSION}" > "${BOSH_INSTALL_TARGET}/VERSION"
+"${BOSH_INSTALL_TARGET}/bin/podman" --version

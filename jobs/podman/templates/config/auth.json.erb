@@ -1,0 +1,13 @@
+<%
+  require 'json'
+  require 'base64'
+
+  auths = {}
+  p("podman.registries.auth", {}).each do |registry, credentials|
+    username = credentials["username"].to_s
+    password = credentials["password"].to_s
+    raise "podman.registries.auth.#{registry}: username and password are required" if username.empty? || password.empty?
+    auths[registry] = { "auth" => Base64.strict_encode64("#{username}:#{password}") }
+  end
+-%>
+<%= JSON.pretty_generate("auths" => auths) %>

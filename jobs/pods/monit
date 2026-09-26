@@ -1,0 +1,24 @@
+# monit 5.2.5 https://gist.github.com/oppegard/46dfa1e40b46aff1fa73c81b10341cab
+<%
+  definitions = p("pods.definitions", {}) || {}
+  definitions.each do |name, definition|
+    stop_timeout = (definition["stop_timeout"] || p("pods.defaults.stop_timeout")).to_i
+    depends_on = Array(definition["depends_on"]).map(&:to_s)
+    depends_on.each do |dependency|
+      raise "pods.definitions.#{name}.depends_on: unknown definition '#{dependency}'" unless definitions.key?(dependency)
+      raise "pods.definitions.#{name}.depends_on: a definition cannot depend on itself" if dependency == name
+    end
+-%>
+check process pod-<%= name %>
+  with pidfile /var/vcap/sys/run/pods/<%= name %>.pid
+  start program "/var/vcap/jobs/pods/bin/pod-ctl start <%= name %>"
+  stop program "/var/vcap/jobs/pods/bin/pod-ctl stop <%= name %>" with timeout <%= stop_timeout + 30 %> seconds
+<% unless depends_on.empty? -%>
+  depends on <%= depends_on.map { |d| "pod-#{d}" }.join(", ") %>
+<% end -%>
+<% Array(definition["monit_additional_entries"]).each do |entry| -%>
+  <%= entry %>
+<% end -%>
+  group vcap
+
+<% end -%>

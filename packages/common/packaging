@@ -1,0 +1,4 @@
+#!/bin/bash -eux
+
+# Copy common utils
+cp -a "${BOSH_COMPILE_TARGET}/common/"* "${BOSH_INSTALL_TARGET}"
