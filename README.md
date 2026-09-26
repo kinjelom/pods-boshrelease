@@ -50,3 +50,7 @@ Details (how it works, logs, metrics, persistent data, limitations): [docs/detai
 ./bosh-upload-release.sh
 bundle exec rspec            # template tests
 ```
+
+### License
+
+[MIT](LICENSE)
