@@ -1,0 +1,53 @@
+name: pods
+version: 1.0.1
+commit_hash: 76a846e
+uncommitted_changes: false
+jobs:
+- name: podman
+  version: 735d46585a4207183c1ca11ee8587a6b7bae334824ffb3f6ed2b0bfc3e431785
+  fingerprint: 735d46585a4207183c1ca11ee8587a6b7bae334824ffb3f6ed2b0bfc3e431785
+  sha1: sha256:22edfb3565e1d655fee7bdd1c0f3af3251739c5a5a848345c86c38233815d636
+  packages:
+  - podman
+  - common
+- name: podman-exporter
+  version: a6db512d1cd81d9713a906302f239238b70534abe2fa341489eabb0c1136d9ca
+  fingerprint: a6db512d1cd81d9713a906302f239238b70534abe2fa341489eabb0c1136d9ca
+  sha1: sha256:7e7e71476fc1ea8e3e5ac1f69be4a9707f14bce34dce78ee566347f7f500d60d
+  packages:
+  - podman-exporter
+  - podman
+  - common
+- name: pods
+  version: a8d534d76b2cc837842fa2f746adb28c003b615e838437712d5be772c1e07029
+  fingerprint: a8d534d76b2cc837842fa2f746adb28c003b615e838437712d5be772c1e07029
+  sha1: sha256:860194470a3b3ad9b8620c55fd443b6f2ec0a616f9be0d950737e26e636f4827
+  packages:
+  - podman
+  - common
+packages:
+- name: common
+  version: aede33230ce40be193ad992ba007290570178383c0874728ca6444279dcbbfdd
+  fingerprint: aede33230ce40be193ad992ba007290570178383c0874728ca6444279dcbbfdd
+  sha1: sha256:974b7802e6f7694942807e3723b1351c81a41a6ffabeede10a6c4224abb77dd1
+  dependencies: []
+- name: golang-1.27-linux
+  version: 4a5b3ef32c78d96b58195b90b0fd51789f48090991bef36ca5df0af1b3453544
+  fingerprint: 4a5b3ef32c78d96b58195b90b0fd51789f48090991bef36ca5df0af1b3453544
+  sha1: sha256:b61a499d93f11f51281eafcc64c22225dd3964b9e1e72cd6892c8bd9bf04b5b6
+  dependencies: []
+- name: podman
+  version: f8fa14d87ccbf73d30b53ccd826e732cec25ea83b0b7f88489c90c6944406658
+  fingerprint: f8fa14d87ccbf73d30b53ccd826e732cec25ea83b0b7f88489c90c6944406658
+  sha1: sha256:4c6cd20ecc8769acaa5e41c3cceb6860c5d3ca425e41df467d2b7ae30582a10f
+  dependencies: []
+- name: podman-exporter
+  version: 128ffc2afc3a5736bc3cea276e6986ffb23c58ff2ba95386ebe4aa1e23d78d55
+  fingerprint: 128ffc2afc3a5736bc3cea276e6986ffb23c58ff2ba95386ebe4aa1e23d78d55
+  sha1: sha256:81cefe52a884be047f68f6c412a6cbb4bd413cda4d7ab21f172376639ca5620c
+  dependencies:
+  - golang-1.27-linux
+license:
+  version: 6955dc016e77b112d8c47b7ff119da4e01451802b78a64a539be0c32c850a063
+  fingerprint: 6955dc016e77b112d8c47b7ff119da4e01451802b78a64a539be0c32c850a063
+  sha1: sha256:b6dae21908014d795e29147acc322d1abde886324eab924fa1d00b77b6b743a6
