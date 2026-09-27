@@ -9,11 +9,11 @@ Requires an **`ubuntu-noble`** stemcell (cgroup v2).
 
 ### Jobs
 
-| Job               | Purpose                                                                       |
-|-------------------|-------------------------------------------------------------------------------|
-| `podman`          | Podman engine configuration (no process).                                     |
-| `pods`            | Runs the Kubernetes YAML definitions: monit process `pod-<name>` each.        |
-| `podman-exporter` | Prometheus metrics of containers, pods, images and volumes (`:9882/metrics`). |
+| Job               | Purpose                                                                                                |
+|-------------------|--------------------------------------------------------------------------------------------------------|
+| `podman`          | Podman engine configuration (no process).                                                              |
+| `pods`            | Runs the Kubernetes YAML definitions: monit process `pod-<name>` each.                                 |
+| `podman-exporter` | Prometheus metrics of containers, pods, images and volumes (`:9882/metrics`), read via the podman API. |
 
 ### Deployment
 

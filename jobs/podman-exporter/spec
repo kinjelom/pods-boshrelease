@@ -2,15 +2,17 @@
 name: podman-exporter
 
 description: |
-  Prometheus exporter for podman (github.com/containers/prometheus-podman-exporter) in local mode:
-  reads the podman state directly (libpod), no podman API service needed. Metrics of containers,
-  pods, images, volumes, networks and podman itself. Requires the `podman` job on the same instance.
+  Prometheus exporter for podman (github.com/containers/prometheus-podman-exporter). Metrics of
+  containers, pods, images, volumes, networks and podman itself. Two monit processes:
+  `podman-exporter-api` (podman API service on a root-only unix socket) and `podman-exporter`
+  (API client, no podman libraries and locks of its own). Requires the `podman` job on the same instance.
 
 templates:
   bin/ctl.sh.erb: bin/ctl
 
 packages:
 - podman-exporter
+- podman
 - common
 
 provides:

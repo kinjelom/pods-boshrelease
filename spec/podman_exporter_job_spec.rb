@@ -37,4 +37,29 @@ describe 'podman-exporter job' do
       render('podman-exporter', 'bin/ctl', { 'podman_exporter' => { 'collectors' => ['containers'] } })
     }.to raise_error(/unknown \["containers"\]/)
   end
+
+  it 'reads podman through the API service on a root-only socket' do
+    ctl = render('podman-exporter', 'bin/ctl', {})
+    expect(ctl).to include('API_DIR="$RUN_DIR/api"', 'chmod 0700 "$API_DIR"',
+                           'podman system service --time=0 "unix://$API_SOCKET"',
+                           'CONTAINER_HOST="unix://$API_SOCKET" setsid /var/vcap/packages/podman-exporter/bin/prometheus-podman-exporter')
+  end
+
+  it 'rejects an unknown action or process before touching the system' do
+    ctl = render('podman-exporter', 'bin/ctl', {})
+    [[], ['start'], ['start', 'podman'], ['restart', 'api']].each do |argv|
+      _out, err, status = Open3.capture3('bash', '-c', ctl, 'ctl', *argv)
+      expect(status.exitstatus).to eq(1)
+      expect(err).to include('Usage: ctl {start|stop} {api|exporter}')
+    end
+  end
+
+  it 'starts the exporter after the API service' do
+    monit = render('podman-exporter', 'monit', {})
+    expect(monit).to include('check process podman-exporter-api', 'bin/ctl start api"', 'bin/ctl stop api"',
+                             'check process podman-exporter', 'bin/ctl start exporter"', 'bin/ctl stop exporter"',
+                             'depends on podman-exporter-api')
+    expect(monit.scan(/with pidfile (\S+)/).flatten).to eq(%w(/var/vcap/sys/run/podman-exporter/podman-api.pid
+                                                              /var/vcap/sys/run/podman-exporter/podman-exporter.pid))
+  end
 end

@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# monit start/stop program of the podman exporter
+# monit start/stop program of the podman API service and of the exporter reading it:
+#   ctl {start|stop} {api|exporter}
 set -euo pipefail
+
+ACTION=${1:-}
+PROCESS=${2:-}
 
 RUN_DIR=/var/vcap/sys/run/podman-exporter
 LOG_DIR=/var/vcap/sys/log/podman-exporter
-PID_FILE="$RUN_DIR/podman-exporter.pid"
+# the API socket is root-equivalent (it can start privileged containers): root-only directory
+API_DIR="$RUN_DIR/api"
+API_SOCKET="$API_DIR/podman.sock"
+
+if [[ ! "$ACTION" =~ ^(start|stop)$ || ! "$PROCESS" =~ ^(api|exporter)$ ]]; then
+  echo "Usage: $0 {start|stop} {api|exporter}" >&2
+  exit 1
+fi
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 exec 1>> "$LOG_DIR/ctl.stdout.log"
@@ -44,42 +55,65 @@ source /var/vcap/jobs/podman/bin/podman-env.sh
 -%>
 ARGS=(<%= args.map { |a| Shellwords.escape(a) }.join(" ") %>)
 
+# podman-api.pid, podman-api.stderr.log, podman-exporter.pid, ...
+PID_FILE="$RUN_DIR/podman-$PROCESS.pid"
+OUT_LOG="$LOG_DIR/podman-$PROCESS.stdout.log"
+ERR_LOG="$LOG_DIR/podman-$PROCESS.stderr.log"
+# graceful stop of the API service: a podman process should not be killed in the middle of an operation
+STOP_TIMEOUT=$([[ "$PROCESS" == api ]] && echo 45 || echo 15)
+
 function pid_alive() {
   [[ -n "${1:-}" ]] && kill -0 "$1" 2> /dev/null
 }
 
-case ${1:-} in
+function start_api() {
+  mkdir -p "$API_DIR"
+  chmod 0700 "$API_DIR"
+  rm -f "$API_SOCKET"
+  log_info "starting podman API service on $API_SOCKET"
+  setsid podman system service --time=0 "unix://$API_SOCKET" >> "$OUT_LOG" 2>> "$ERR_LOG" < /dev/null &
+  echo $! > "$PID_FILE"
+}
+
+function start_exporter() {
+  # monit starts the API service first (depends on), its socket appears a moment later
+  for ((i = 0; i < 30; i++)); do
+    [[ -S "$API_SOCKET" ]] && break
+    sleep 1
+  done
+  if [[ ! -S "$API_SOCKET" ]]; then
+    log_error "podman API socket $API_SOCKET not found, see $LOG_DIR/podman-api.stderr.log"
+    exit 1
+  fi
+  log_info "starting podman-exporter ${ARGS[*]}"
+  CONTAINER_HOST="unix://$API_SOCKET" setsid /var/vcap/packages/podman-exporter/bin/prometheus-podman-exporter \
+    "${ARGS[@]}" >> "$OUT_LOG" 2>> "$ERR_LOG" < /dev/null &
+  echo $! > "$PID_FILE"
+}
+
+case "$ACTION" in
   start)
     if pid_alive "$(cat "$PID_FILE" 2> /dev/null || true)"; then
-      log_info "podman-exporter is already running"
+      log_info "podman-$PROCESS is already running"
       exit 0
     fi
-    log_info "starting podman-exporter ${ARGS[*]}"
-    setsid /var/vcap/packages/podman-exporter/bin/prometheus-podman-exporter "${ARGS[@]}" \
-      >> "$LOG_DIR/podman-exporter.stdout.log" 2>> "$LOG_DIR/podman-exporter.stderr.log" < /dev/null &
-    echo $! > "$PID_FILE"
+    "start_$PROCESS"
     ;;
 
   stop)
     pid=$(cat "$PID_FILE" 2> /dev/null || true)
     if pid_alive "$pid"; then
-      log_info "stopping podman-exporter (pid $pid)"
-      # graceful stop only: a podman library process killed while holding a lock leaks that lock
+      log_info "stopping podman-$PROCESS (pid $pid)"
       kill -TERM "$pid"
-      for ((i = 0; i < 45; i++)); do
+      for ((i = 0; i < STOP_TIMEOUT; i++)); do
         pid_alive "$pid" || break
         sleep 1
       done
       if pid_alive "$pid"; then
-        log_warn "podman-exporter did not stop within 45s, killing it"
+        log_warn "podman-$PROCESS did not stop within ${STOP_TIMEOUT}s, killing it"
         kill -KILL "$pid" || true
       fi
     fi
     rm -f "$PID_FILE"
-    ;;
-
-  *)
-    echo "Usage: $0 {start|stop}" >&2
-    exit 1
     ;;
 esac

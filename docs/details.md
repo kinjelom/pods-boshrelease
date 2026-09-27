@@ -81,9 +81,14 @@ tags:
   prometheus_exporter_port: ((pods_exporter_port))
 ```
 
-The exporter reads podman's state with the podman libraries and takes the same (per-container) locks as
-`podman ps`: keep the scrape interval >= 30s. It is stopped gracefully (SIGTERM, 45s) because a podman process
-killed while holding a lock leaks that lock.
+The exporter is a client of a podman API service run by the same job: monit process `podman-exporter-api`
+(`podman system service` on the root-only socket `/var/vcap/sys/run/podman-exporter/api/podman.sock`), logs in
+`/var/vcap/sys/log/podman-exporter/`. The exporter links no podman libraries on purpose: libpod keeps its locks as
+pthread mutexes in `/dev/shm/libpod_lock`, whose layout is libc specific, and the podman-static binaries use musl.
+An exporter reading podman's state in-process (upstream "local mode", glibc) blocks forever on the first lock -
+scrapes hang until `Limit of concurrent requests reached` - and corrupts the lock segment for podman.
+Every scrape lists containers and pods through the API, taking the same locks as `podman ps`: keep the scrape
+interval >= 30s.
 
 ### Persistent data
 
@@ -117,7 +122,7 @@ Registries: `podman.registries.{unqualified_search,insecure,mirrors,auth,policy}
 bosh ssh pods/0
 sudo -i
 podman ps --pod                    # PATH, auth and bash completion come from /etc/profile.d/podman-bosh.sh
-monit summary                      # pod-<definition> processes
+monit summary                      # pod-<definition>, podman-exporter-api, podman-exporter processes
 cat /var/vcap/data/pods/definitions/<def>/kube.yml
 ```
 

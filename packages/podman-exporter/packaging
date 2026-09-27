@@ -11,10 +11,12 @@ tar xzf "${BOSH_COMPILE_TARGET}/podman-exporter/prometheus-podman-exporter-${POD
 source /var/vcap/packages/golang-*-linux/bosh/compile.env
 mkdir -p "${BOSH_INSTALL_TARGET}/bin"
 
-# Local (libpod) mode: reads podman's state directly, no podman API service needed.
-# cgo is required by libpod (shm locks); only libc is linked with these tags.
-export CGO_ENABLED=1 GOFLAGS=-mod=vendor GOTOOLCHAIN=local
-BUILD_TAGS="containers_image_openpgp exclude_graphdriver_btrfs"
+# Remote mode (`remote` tag, no cgo): the exporter is a client of the podman API service run by the job.
+# Local (libpod) mode must not be used: libpod keeps its locks as pthread mutexes in /dev/shm/libpod_lock,
+# whose layout is libc specific. The podman-static binaries are linked with musl, a cgo build here links
+# glibc: it blocks forever on the first lock and corrupts the lock segment for podman.
+export CGO_ENABLED=0 GOFLAGS=-mod=vendor GOTOOLCHAIN=local
+BUILD_TAGS="remote containers_image_openpgp exclude_graphdriver_btrfs"
 LDFLAGS="-X github.com/containers/prometheus-podman-exporter/cmd.buildVersion=${PODMAN_EXPORTER_VERSION}"
 
 pushd "prometheus-podman-exporter-${PODMAN_EXPORTER_VERSION}"

@@ -1,6 +1,13 @@
 # monit 5.2.5 https://gist.github.com/oppegard/46dfa1e40b46aff1fa73c81b10341cab
+check process podman-exporter-api
+  with pidfile /var/vcap/sys/run/podman-exporter/podman-api.pid
+  start program "/var/vcap/jobs/podman-exporter/bin/ctl start api"
+  stop program "/var/vcap/jobs/podman-exporter/bin/ctl stop api" with timeout 60 seconds
+  group vcap
+
 check process podman-exporter
   with pidfile /var/vcap/sys/run/podman-exporter/podman-exporter.pid
-  start program "/var/vcap/jobs/podman-exporter/bin/ctl start"
-  stop program "/var/vcap/jobs/podman-exporter/bin/ctl stop" with timeout 60 seconds
+  start program "/var/vcap/jobs/podman-exporter/bin/ctl start exporter" with timeout 40 seconds
+  stop program "/var/vcap/jobs/podman-exporter/bin/ctl stop exporter" with timeout 30 seconds
+  depends on podman-exporter-api
   group vcap
