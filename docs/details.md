@@ -81,6 +81,12 @@ tags:
   prometheus_exporter_port: ((pods_exporter_port))
 ```
 
+Grafana dashboard: [dashboard.json](dashboard.json) (import it; Grafana 12+). Overview (pods/containers not
+running, unhealthy, restarts), pod and container tables with state/health timelines, CPU, memory (also against the
+limit), processes, network per pod, block I/O, writable layer, images, volumes, podman/exporter versions.
+Variables: `deployment` (the `bosh_deployment` target label, when the service discovery sets one), `instance`,
+`pod`, `container`. It relies on `enhance_metrics: true` (default): the `name`/`pod_name` labels on all metrics.
+
 The exporter is a client of a podman API service run by the same job: monit process `podman-exporter-api`
 (`podman system service` on the root-only socket `/var/vcap/sys/run/podman-exporter/api/podman.sock`), logs in
 `/var/vcap/sys/log/podman-exporter/`. The exporter links no podman libraries on purpose: libpod keeps its locks as
