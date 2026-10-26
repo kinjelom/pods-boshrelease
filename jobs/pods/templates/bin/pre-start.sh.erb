@@ -54,12 +54,21 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
     end
 
     kept, dropped = documents.partition { |doc| supported_kinds.include?(doc["kind"]) }
+    stop_timeout = Integer(setting.call(definition, "stop_timeout"))
 
     pods = kept.select { |doc| pod_kinds.include?(doc["kind"]) }.map do |doc|
       object = "#{doc["kind"]}/#{doc["metadata"]["name"]}"
       if doc["kind"] == "Deployment"
         replicas = doc.dig("spec", "replicas") || 1
         raise "#{where}: #{object} has #{replicas} replicas, podman supports exactly 1" unless replicas.to_i == 1
+      end
+      # podman SIGKILLs a container after terminationGracePeriodSeconds, pod-ctl kills the whole teardown after
+      # stop_timeout (+15s): a longer grace period would be cut short (and podman killed while holding its lock)
+      spec = doc["kind"] == "Pod" ? doc["spec"] : doc.dig("spec", "template", "spec")
+      grace = spec.is_a?(Hash) ? spec["terminationGracePeriodSeconds"] : nil
+      if grace && Integer(grace) > stop_timeout
+        raise "#{where}: #{object} terminationGracePeriodSeconds (#{grace}) exceeds stop_timeout (#{stop_timeout}), " \
+              "the graceful stop would be cut short"
       end
       # podman names the pod of a Deployment/DaemonSet "<name>-pod"
       doc["kind"] == "Pod" ? doc["metadata"]["name"] : "#{doc["metadata"]["name"]}-pod"
@@ -118,7 +127,7 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       FOLLOW_LOGS=#{Shellwords.escape(setting.call(definition, "follow_logs").to_s)}
       WAIT_HEALTHY=#{Shellwords.escape(setting.call(definition, "wait_healthy").to_s)}
       START_TIMEOUT=#{Integer(setting.call(definition, "start_timeout"))}
-      STOP_TIMEOUT=#{Integer(setting.call(definition, "stop_timeout"))}
+      STOP_TIMEOUT=#{stop_timeout}
       POLL_INTERVAL=#{Integer(p("pods.supervisor.poll_interval"))}
       HOST_PATH_OWNERS=#{bash_array.call(owners.map { |path, o| "#{path}|#{o["owner"]}|#{o["create"]}" })}
       HOST_PATH_PREFIXES=#{bash_array.call(host_path_prefixes)}

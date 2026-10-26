@@ -136,6 +136,44 @@ describe 'pods job' do
         render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => { 'Bad_Name' => { 'manifest' => redis_pod } } } })
       }.to raise_error(/invalid name/)
     end
+
+    it 'rejects a terminationGracePeriodSeconds longer than stop_timeout' do
+      graceful = ->(grace) { redis_pod.merge('spec' => redis_pod['spec'].merge('terminationGracePeriodSeconds' => grace)) }
+      expect {
+        render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => { 'x' => { 'manifest' => graceful.call(61) } } } })
+      }.to raise_error(%r{Pod/redis terminationGracePeriodSeconds \(61\) exceeds stop_timeout \(60\)})
+      deployment = { 'kind' => 'Deployment', 'metadata' => { 'name' => 'web' },
+                     'spec' => { 'template' => { 'spec' => graceful.call(300)['spec'] } } }
+      expect {
+        render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => { 'x' => { 'manifest' => deployment, 'stop_timeout' => 299 } } } })
+      }.to raise_error(%r{Deployment/web terminationGracePeriodSeconds \(300\)})
+      pre_start = render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => {
+        'x' => { 'manifest' => graceful.call(600), 'stop_timeout' => 600 },
+      } } })
+      expect(written_definitions(pre_start)['x']['env']).to include('STOP_TIMEOUT=600')
+    end
+  end
+
+  describe 'bin/drain' do
+    it 'stops dependents before their dependencies and reports 0 on the original stdout' do
+      drain = render('pods', 'bin/drain', { 'pods' => { 'definitions' => {
+        'db' => { 'manifest' => redis_pod },
+        'app' => { 'manifest' => redis_pod, 'depends_on' => ['cache', 'db'] },
+        'cache' => { 'manifest' => redis_pod, 'depends_on' => ['db'] },
+        'tool' => { 'manifest' => redis_pod },
+      } } })
+      expect(bash_syntax_ok?(drain)).to be(true)
+      expect(drain).to include('for name in tool app cache db; do', 'echo 0 >&3')
+    end
+
+    it 'rejects dependency cycles' do
+      expect {
+        render('pods', 'bin/drain', { 'pods' => { 'definitions' => {
+          'a' => { 'manifest' => redis_pod, 'depends_on' => ['b'] },
+          'b' => { 'manifest' => redis_pod, 'depends_on' => ['a'] },
+        } } })
+      }.to raise_error(/depends_on cycle a -> b -> a/)
+    end
   end
 
   describe 'monit' do
@@ -159,7 +197,7 @@ describe 'pods job' do
 
   it 'renders syntactically valid scripts' do
     props = { 'pods' => { 'definitions' => { 'redis' => { 'manifest' => redis_pod } } } }
-    %w[bin/pre-start bin/post-start bin/pod-ctl bin/pod-supervisor bin/pods-env.sh].each do |template|
+    %w[bin/pre-start bin/post-start bin/drain bin/pod-ctl bin/pod-supervisor bin/pods-env.sh].each do |template|
       expect(bash_syntax_ok?(render('pods', template, props))).to be(true)
     end
   end

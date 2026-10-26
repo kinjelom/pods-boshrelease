@@ -21,3 +21,5 @@ terraform.tfstate*
 plan
 *-creds.yml
 prv-notes.md
+example-todo
+Gemfile.lock

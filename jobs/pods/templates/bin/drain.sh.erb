@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# BOSH drain: stops every pod definition gracefully before BOSH stops the monit processes.
+# BOSH unmonitors the processes before the drain and puts no time limit on it, while its job stop gives up after
+# 5 minutes and carries on (e.g. deletes the VM of a recreate) - so a teardown that may take longer (stop_timeout)
+# has to happen here. Dependents are stopped before the definitions they depend on; `monit stop` afterwards finds
+# nothing left to stop. stdout carries only the drain result (0 = done).
+set -euo pipefail
+
+LOG_DIR=/var/vcap/sys/log/pods
+mkdir -p "$LOG_DIR"
+
+SCRIPT_NAME=$(basename "$0")
+exec 3>&1
+exec 1>> "${LOG_DIR}/${SCRIPT_NAME}.stdout.log"
+exec 2>> "${LOG_DIR}/${SCRIPT_NAME}.stderr.log"
+
+source /var/vcap/jobs/pods/bin/pods-env.sh
+
+log_info "--- ${SCRIPT_NAME} begin ($*)"
+<%
+  definitions = p("pods.definitions", {}) || {}
+  # depends_on in topological order (dependencies first), stopped in reverse
+  order = []
+  visit = lambda do |name, path|
+    raise "pods.definitions: depends_on cycle #{(path + [name]).join(" -> ")}" if path.include?(name)
+    next if order.include?(name)
+    raise "pods.definitions.#{path.last}.depends_on: unknown definition '#{name}'" unless definitions.key?(name)
+    Array(definitions[name]["depends_on"]).map(&:to_s).each { |dependency| visit.call(dependency, path + [name]) }
+    order << name
+  end
+  definitions.keys.each { |name| visit.call(name, []) }
+-%>
+
+failed=0
+for name in <%= order.reverse.join(" ") %>; do
+  if [[ ! -f "$PODS_DEFS_DIR/$name/definition.env" ]]; then
+    log_warn "definition '$name' is not installed, nothing to stop"
+    continue
+  fi
+  log_info "stopping '$name'"
+  if ! "$PODS_JOB_DIR/bin/pod-ctl" stop "$name"; then
+    log_error "stopping '$name' failed, see $PODS_LOG_ROOT/$name/pod-ctl.*.log"
+    failed=1
+  fi
+done
+
+if ((failed)); then
+  log_error "--- ${SCRIPT_NAME} failed"
+  exit 1
+fi
+log_info "--- ${SCRIPT_NAME} success"
+echo 0 >&3

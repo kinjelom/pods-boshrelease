@@ -19,6 +19,7 @@ monit ─ pod-ctl start <def> ─ setsid pod-supervisor <def>           (monit w
                                 ├─ tail -F <container k8s-file log> >> /var/vcap/sys/log/pods/<def>/<container>.log
                                 └─ podman healthcheck run <container>   (liveness/startup probes)
 monit ─ pod-ctl stop <def>  → SIGTERM → podman kube down (named volumes kept) → followers stopped
+drain ─ pod-ctl stop <def>  for every definition, dependents first (BOSH unmonitors the processes before)
 ```
 
 * **pre-start** (pods) validates and writes each definition to `/var/vcap/data/pods/definitions/<def>/`
@@ -26,7 +27,12 @@ monit ─ pod-ctl stop <def>  → SIGTERM → podman kube down (named volumes ke
   listed in the `kube.yml` header; Deployments must have 1 replica. Definitions removed from the manifest
   are cleaned up.
 * **post-start** fails the deploy unless every pod is running (and healthy, when probes are defined)
-  within `start_timeout`.
+  within `start_timeout`. BOSH does not go on (next instance, next deploy) before that, so the `startupProbe`
+  should check that the application is really ready (e.g. answers its API), not only that a port is open.
+* **drain** stops the definitions gracefully before BOSH stops the jobs: BOSH puts no time limit on a drain, while
+  it abandons its job stop after 5 minutes and carries on (e.g. deletes the VM of a recreate). Each definition gets
+  `stop_timeout` (+15s) for `podman kube down`, which gives every container `terminationGracePeriodSeconds`
+  (podman's stop timeout) before SIGKILL; pre-start rejects a grace period longer than `stop_timeout`.
 * Container restarts (`restartPolicy`) are handled by podman/conmon; a failing `livenessProbe` restarts
   the container.
 
@@ -40,7 +46,7 @@ pods:
     redis:
       depends_on: [ ]        # other definitions started first (monit dependency)
       start_timeout: 300    # post-start waits for running/healthy pods (includes image pulls)
-      stop_timeout: 60      # graceful teardown
+      stop_timeout: 60      # graceful teardown (drain, monit stop), >= terminationGracePeriodSeconds
       manifest: # hash, list of hashes, or a multi-document YAML string (e.g. helm template output)
         - apiVersion: v1
           kind: Pod
@@ -144,6 +150,11 @@ cat /var/vcap/data/pods/definitions/<def>/kube.yml
 * Netavark (Podman 6) only supports the `nftables` firewall driver - the `nft` binary must exist on the stemcell
   for bridge networking (`podman.network.firewall_driver: none` + `hostNetwork` otherwise).
 * Definitions are meant for long-running services: a pod whose infra container stops is replayed by monit.
+* Stateful services (databases): give them a `terminationGracePeriodSeconds` long enough for a stop under load
+  (migrations, compaction) - SIGKILL after the grace period is an unclean shutdown. Long grace periods are only
+  safe through the drain: avoid `bosh stop/recreate --skip-drain`, BOSH stops waiting for `monit stop` after 5 minutes.
+* A failing `startupProbe` (`failureThreshold` × `periodSeconds`) restarts the container: allow for the longest
+  start (e.g. a database migration after an upgrade).
 
 Podman binaries come from [mgoltzsche/podman-static](https://github.com/mgoltzsche/podman-static)
 (podman, conmon, crun, runc, netavark, aardvark-dns, catatonit, pasta).

@@ -10,6 +10,7 @@ description: |
 templates:
   bin/pre-start.sh.erb: bin/pre-start
   bin/post-start.sh.erb: bin/post-start
+  bin/drain.sh.erb: bin/drain
   bin/pods-env.sh: bin/pods-env.sh
   bin/pod-ctl.sh: bin/pod-ctl
   bin/pod-supervisor.sh: bin/pod-supervisor
@@ -30,7 +31,8 @@ properties:
                          ServiceAccount, ...) are dropped and listed in the rendered file header.
         depends_on:      names of other definitions started before this one (monit dependency)
         start_timeout:   seconds post-start waits for the pods to be running (and healthy)
-        stop_timeout:    seconds granted for a graceful teardown
+        stop_timeout:    seconds granted for a graceful teardown (BOSH drain, monit stop), must be
+                         >= terminationGracePeriodSeconds of its pods
         play_flags:      extra `podman kube play` flags, e.g. ["--network", "host"]
         follow_logs:     copy container output to /var/vcap/sys/log/pods/<name>/<container>.log
         wait_healthy:    post-start also waits for containers with probes to become healthy
@@ -60,7 +62,9 @@ properties:
     description: "Default `start_timeout` of a definition (includes image pulls)"
     default: 300
   pods.defaults.stop_timeout:
-    description: "Default `stop_timeout` of a definition"
+    description: |
+      Default `stop_timeout` of a definition. The drain stops the definitions without a BOSH time limit;
+      a plain `monit stop` (e.g. `bosh stop --skip-drain`) is abandoned by BOSH after 5 minutes.
     default: 60
   pods.defaults.play_flags:
     description: "Default `play_flags` of a definition"
