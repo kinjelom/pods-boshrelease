@@ -7,5 +7,5 @@ source ./rel.env
 unset BOSH_ALL_PROXY
 
 chmod a+r "$REL_TARBALL_PATH"
-source ~/.bosh/dev3.env
+# source ~/.bosh/dev3.env
 bosh upload-release "$REL_TARBALL_PATH"
