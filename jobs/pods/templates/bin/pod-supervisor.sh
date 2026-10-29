@@ -4,6 +4,8 @@
 #  - with egress rules: creates the pods stopped, starts each infra container (it holds the pod's network
 #    namespace), loads the rules into that namespace and only then starts the other (init) containers;
 #    reloads them when the infra container gets restarted behind the supervisor's back,
+#  - with an egress connection log: moves the connections recorded by the rules into
+#    /var/vcap/sys/log/pods/<definition>/egress.log every poll,
 #  - exits when a pod disappears or its infra container stops, so monit restarts the whole definition,
 #  - follows container output into /var/vcap/sys/log/pods/<definition>/<container>.log,
 #  - runs container healthchecks (livenessProbe/startupProbe): the static podman build has no systemd
@@ -38,9 +40,16 @@ function stop_followers() {
 }
 
 function shutdown() {
+  local pod
   log_info "stop requested, tearing down the pods of '$NAME'"
   # a pending `kube play` (e.g. pulling images) is interrupted, podman handles SIGTERM gracefully
   pid_alive "$CHILD_PID" && kill -TERM "$CHILD_PID" 2> /dev/null
+  # the connections since the last poll
+  if [[ "$EGRESS_LOG" != "none" ]]; then
+    for pod in "${!EGRESS_PID[@]}"; do
+      egress_collect "$pod"
+    done
+  fi
   podman kube down "$PODS_KUBE_FILE" || log_warn "kube down of '$NAME' failed"
   stop_followers
   log_info "'$NAME' torn down"
@@ -185,7 +194,27 @@ function egress_apply() {
     return 1
   fi
   EGRESS_PID[$pod]=$pid
-  log_info "egress rules loaded into pod '$pod' (infra pid $pid${servers:+, nameservers: $servers})"
+  log_info "egress rules loaded into pod '$pod' (infra pid $pid${servers:+, nameservers: $servers}, connection log: $EGRESS_LOG)"
+}
+
+# egress_collect <pod>: moves the connections recorded by the log sets of the pod's egress rules into egress.log
+# (bin/egress-log.awk) and deletes the logged elements in one nft transaction. Packets counted between the listing
+# and the deletion are missing from the counts (never a destination: it has just been logged).
+function egress_collect() {
+  local pod=$1 pid=${EGRESS_PID[$1]:-}
+  [[ -n "$pid" ]] || return 0
+  rm -f "$WORK_DIR/egress-delete"
+  if ! nsenter --target "$pid" --net nft -n list table inet pods_egress > "$WORK_DIR/egress-sets" 2>> "$PODS_LOG_DIR/supervisor.stderr.log"; then
+    log_warn "reading the egress connection log of pod '$pod' failed"
+    return 0
+  fi
+  awk -v time="$(date +"%Y-%m-%dT%H:%M:%S%z")" -v prefix="definition=$NAME pod=$pod" \
+    -v logfile="$PODS_LOG_DIR/egress.log" -v deletefile="$WORK_DIR/egress-delete" \
+    -f "$PODS_JOB_DIR/bin/egress-log.awk" "$WORK_DIR/egress-sets"
+  if [[ -s "$WORK_DIR/egress-delete" ]] &&
+    ! nsenter --target "$pid" --net nft -f "$WORK_DIR/egress-delete" 2>> "$PODS_LOG_DIR/supervisor.stderr.log"; then
+    log_warn "emptying the egress connection log of pod '$pod' failed, its connections may be logged again"
+  fi
 }
 
 # start_egress_pod <pod>: starts a pod created stopped - the infra container first (it creates the network
@@ -262,6 +291,7 @@ while true; do
         run_healthcheck "$ctr" "$interval"
       fi
     done < "$WORK_DIR/ps"
+    [[ "$EGRESS_LOG" == "none" ]] || egress_collect "$pod"
   done
 
   # interruptible sleep (the TERM trap runs immediately)

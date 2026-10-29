@@ -39,7 +39,8 @@ jobs:
 ```
 
 Example: [example/manifests/pods.yml](example/manifests/pods.yml)
-Details (how it works, logs, metrics, persistent data, egress allowlists, limitations): [docs/details.md](docs/details.md).
+Details (how it works, logs, metrics, persistent data, egress allowlists and connection log, the `pods` operator
+command, limitations): [docs/details.md](docs/details.md).
 Grafana dashboard for the `podman-exporter` metrics: [docs/dashboard.json](docs/dashboard.json).
 
 ### Development

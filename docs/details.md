@@ -72,7 +72,8 @@ All keys and defaults: [jobs/pods/spec](../jobs/pods/spec).
 `/var/vcap/sys/log/pods/<definition>/<pod>-<container>.log` in CRI format (`<time> <stdout|stderr> <F|P> <line>`),
 rotated by the stemcell logrotate, collected by `bosh logs` and syslog forwarders. Podman's internal copy is
 capped by `podman.containers.log_size_max`. Script logs: `pre-start.*.log`, `post-start.*.log`,
-`<definition>/pod-ctl.*.log`, `<definition>/supervisor.*.log`, podman events: `/var/vcap/sys/log/podman/events.log`.
+`<definition>/pod-ctl.*.log`, `<definition>/supervisor.*.log`, podman events: `/var/vcap/sys/log/podman/events.log`,
+outbound connections of definitions with `egress`: `<definition>/egress.log` (see [connection log](#connection-log)).
 
 ### Metrics
 
@@ -138,6 +139,7 @@ pods:
           - { to: 10.0.7.1, protocol: icmp }
           - { to: "2001:db8::/32", protocol: all }                 # any protocol and port
         dns: true           # port 53 to the pod's nameservers (default false: names do not resolve)
+        log: all            # connection log: none | blocked (default, pods.defaults.egress_log) | all
       manifest: [ ... ]
 ```
 
@@ -162,12 +164,45 @@ The rules hold as long as no container can change or get around them. Pre-start 
 bounding capabilities, so these capabilities are caught even when they come from
 `podman.raw_config.containers_conf` (`default_capabilities`).
 
-Inspect the rules and the counters of blocked packets:
+Inspect the rules and the counters of blocked packets: `pods egress <definition>`, or by hand:
 
 ```bash
 pid=$(podman ps --filter pod=<pod> --format '{{.IsInfra}} {{.Pid}}' | awk '$1 == "true" { print $2 }')
 nsenter --target "$pid" --net nft list table inet pods_egress
 ```
+
+#### Connection log
+
+`egress.log` controls which outbound connections end up in `/var/vcap/sys/log/pods/<definition>/egress.log`
+(rotated by the stemcell logrotate, collected by `bosh logs` and syslog forwarders like the other job logs):
+
+| `log`               | logged                                                                  |
+|---------------------|-------------------------------------------------------------------------|
+| `none`              | nothing                                                                 |
+| `blocked` (default) | packets blocked by the rules                                            |
+| `all`               | every new outbound connection, allowed (DNS included) and blocked: audit |
+
+The job-wide default is `pods.defaults.egress_log`. Every `pods.supervisor.poll_interval` the supervisor writes one
+line per pod, verdict, protocol, destination and port seen since the previous poll:
+
+```
+2026-10-29T16:20:05+0000 definition=app pod=app verdict=allowed proto=tcp dst=10.0.5.20 dport=5432 count=2
+2026-10-29T16:20:05+0000 definition=app pod=app verdict=blocked proto=tcp dst=203.0.113.7 dport=443 count=3
+2026-10-29T16:20:05+0000 definition=app pod=app verdict=blocked proto=icmp dst=10.0.7.2 count=1
+```
+
+* `count`: allowed - new connections (a flow is counted once, by its first packet, also a UDP flow without
+  replies); blocked - packets, i.e. failed attempts (`connect()` refused, `sendto()` with `Operation not permitted`).
+* `dport` only for tcp/udp; `proto` is `tcp`, `udp`, `icmp`, `icmpv6`, `sctp` or the protocol number.
+* The timestamp is when the line was written: the connections happened within the poll interval before it.
+  Replies and packets of established connections are never logged, inbound connections neither.
+
+How: the rules record each connection in dynamic nftables sets (`allowed4`, `blocked6_noport`, ... keyed by
+destination, protocol and port, with a counter per element) - in the kernel, without `nf_log_all_netns` and without
+a per-packet log. The supervisor lists the sets with `nft`, appends the lines (`bin/egress-log.awk`) and deletes the
+logged elements. A set takes 4096 destinations per poll interval: beyond that a `warning="log set ... full"` line
+says that further destinations were not logged. Packets counted between the listing and the deletion (milliseconds)
+are missing from the counts, never a destination. The connections since the last poll are written on a stop too.
 
 ### Configuration
 
@@ -181,10 +216,18 @@ Registries: `podman.registries.{unqualified_search,insecure,mirrors,auth,policy}
 ```bash
 bosh ssh pods/0
 sudo -i
+pods                               # definitions: monit process, pods, containers (state, health)
+pods logs <def> [-c <container>] -f --tail 100
+pods exec <def> [-c <container>] [-- <command>]
+pods describe <def>                # settings, files, containers; also: ps, egress, restart, kube (pods help)
 podman ps --pod                    # PATH, auth and bash completion come from /etc/profile.d/podman-bosh.sh
 monit summary                      # pod-<definition>, podman-exporter-api, podman-exporter processes
-cat /var/vcap/data/pods/definitions/<def>/kube.yml
 ```
+
+`pods` (`/usr/local/bin/pods`, root only) is a kubectl-like view of the definitions of the VM on top of podman and
+monit - there is no Kubernetes API, so `kubectl` cannot be used. `<container>` is the name from the manifest (or
+podman's `<pod>-<container>`) and may be omitted when only one container runs. Bash completion:
+`/etc/profile.d/pods-bosh.sh` (`pods.shell_profile`).
 
 ### Known limitations / notes
 

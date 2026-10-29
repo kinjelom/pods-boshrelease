@@ -34,12 +34,26 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
   # discovery leave the pod; the dns sets are filled at runtime from the pod's resolv.conf.
   # A container able to bypass the rules (NET_ADMIN flushes them, NET_RAW sends packets around them) is rejected.
   bypass_caps = %w(NET_ADMIN NET_RAW SYS_ADMIN ALL)
+  # connection log: dynamic sets keyed by destination . protocol . port (other protocols: without the port) with a
+  # counter per element; every poll the supervisor moves them into egress.log (bin/egress-log.awk) and empties them
+  log_levels = { "none" => [], "blocked" => %w(blocked), "all" => %w(allowed blocked) }
+  log_set_size = 4096
+  log_families = [["4", "ip", "ipv4_addr"], ["6", "ip6", "ipv6_addr"]]
+  log_record = lambda do |verdict|
+    log_families.flat_map do |family, address, _type|
+      ["meta nfproto ipv#{family} meta l4proto { tcp, udp } add @#{verdict}#{family} { #{address} daddr . meta l4proto . th dport counter }",
+       "meta nfproto ipv#{family} meta l4proto != { tcp, udp } add @#{verdict}#{family}_noport { #{address} daddr . meta l4proto counter }"]
+    end
+  end
   egress_rules = lambda do |where, egress, documents, play_flags|
-    raise "#{where}: must be a hash (allow, dns)" unless egress.is_a?(Hash)
-    unknown = egress.keys.map(&:to_s) - %w(allow dns)
+    raise "#{where}: must be a hash (allow, dns, log)" unless egress.is_a?(Hash)
+    unknown = egress.keys.map(&:to_s) - %w(allow dns log)
     raise "#{where}: unknown key(s) #{unknown.join(", ")}" unless unknown.empty?
     raise "#{where}.allow: must be a list" unless egress["allow"].nil? || egress["allow"].is_a?(Array)
     raise "#{where}.dns: must be true or false" unless [nil, true, false].include?(egress["dns"])
+    log = (egress.key?("log") ? egress["log"] : p("pods.defaults.egress_log")).to_s
+    raise "#{where}.log: \"#{log}\" is not #{log_levels.keys.join(", ")}" unless log_levels.key?(log)
+    logged = log_levels[log]
 
     documents.select { |doc| pod_kinds.include?(doc["kind"]) }.each do |doc|
       object = "#{doc["kind"]}/#{doc["metadata"]["name"]}"
@@ -82,18 +96,25 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       case protocol
       when "tcp", "udp"
         raise "#{at}: port or ports required for #{protocol} (all ports: 1-65535)" if ports.empty?
-        "#{daddr} #{protocol} dport { #{ports.uniq.join(", ")} } accept"
+        "#{daddr} #{protocol} dport { #{ports.uniq.join(", ")} }"
       when "icmp", "all"
         raise "#{at}: protocol #{protocol} takes no ports" unless ports.empty?
-        protocol == "all" ? "#{daddr} accept" : "#{daddr} meta l4proto #{to.ipv4? ? "icmp" : "ipv6-icmp"} accept"
+        protocol == "all" ? daddr : "#{daddr} meta l4proto #{to.ipv4? ? "icmp" : "ipv6-icmp"}"
       else
         raise "#{at}.protocol: \"#{protocol}\" is not tcp, udp, icmp or all"
       end
     end
 
     dns = egress["dns"] == true
+    accept = logged.include?("allowed") ? "goto allowed" : "accept"
     lines = ["table inet pods_egress", "delete table inet pods_egress", "table inet pods_egress {"]
     lines += ["  set dns4 { type ipv4_addr; }", "  set dns6 { type ipv6_addr; }"] if dns
+    logged.each do |verdict|
+      log_families.each do |family, _address, type|
+        lines += ["  set #{verdict}#{family} { type #{type} . inet_proto . inet_service; size #{log_set_size}; flags dynamic; }",
+                  "  set #{verdict}#{family}_noport { type #{type} . inet_proto; size #{log_set_size}; flags dynamic; }"]
+      end
+    end
     lines += [
       "  chain output {",
       "    type filter hook output priority filter; policy drop;",
@@ -101,12 +122,22 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       "    ct state established,related accept",
       "    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept",
     ]
-    lines += ["    ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept",
-              "    ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept"] if dns
-    lines += rules.map { |rule| "    #{rule}" }
+    lines += ["    ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 #{accept}",
+              "    ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 #{accept}"] if dns
+    lines += rules.map { |rule| "    #{rule} #{accept}" }
+    # every blocked packet is recorded: it fails in the application, there is no connection to count it once
+    lines += log_record.call("blocked").map { |rule| "    #{rule}" } if logged.include?("blocked")
     # a dropped SYN would leave connect() retrying for minutes, a reset fails it at once (other packets: EPERM)
-    lines += ["    meta l4proto tcp counter reject with tcp reset", "    counter drop", "  }", "}"]
-    { "script" => lines.join("\n") + "\n", "dns" => dns, "rules" => rules.size }
+    lines += ["    meta l4proto tcp counter reject with tcp reset", "    counter drop", "  }"]
+    if logged.include?("allowed")
+      # an allowed connection is recorded once, by its first packet: the conntrack mark skips the others still
+      # in state new (e.g. TCP SYN retransmits, UDP datagrams of a flow without replies)
+      lines += ["  chain allowed {", "    ct mark 0x1 accept", "    ct mark set 0x1"]
+      lines += log_record.call("allowed").map { |rule| "    #{rule}" }
+      lines += ["    accept", "  }"]
+    end
+    lines << "}"
+    { "script" => lines.join("\n") + "\n", "dns" => dns, "rules" => rules.size, "log" => log }
   end
 
   host_path_prefixes = Array(p("pods.host_paths.allowed_prefixes")).map { |prefix| prefix.to_s.end_with?("/") ? prefix.to_s : "#{prefix}/" }
@@ -217,6 +248,7 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       HOST_PATH_PREFIXES=#{bash_array.call(host_path_prefixes)}
       EGRESS_RULES=#{egress ? Shellwords.escape(egress["script"]) : "''"}
       EGRESS_DNS=#{egress && egress["dns"] ? "true" : "false"}
+      EGRESS_LOG=#{egress ? egress["log"] : "none"}
     ENV
 
     { "name" => name, "kube" => kube, "env" => env, "pods" => pods, "dropped" => dropped.size, "owners" => owners, "egress" => egress }
@@ -255,7 +287,7 @@ log_info "definition '<%= d["name"] %>': pods <%= d["pods"].join(", ") %><%= d["
 log_info <%= Shellwords.escape("definition '#{d["name"]}': hostPath #{path} owned by #{o["owner"]} (#{o["from"]})") %>
 <% end -%>
 <% if d["egress"] -%>
-log_info "definition '<%= d["name"] %>': egress restricted to <%= d["egress"]["rules"] %> allow rule(s)<%= d["egress"]["dns"] ? " + DNS" : "" %>"
+log_info "definition '<%= d["name"] %>': egress restricted to <%= d["egress"]["rules"] %> allow rule(s)<%= d["egress"]["dns"] ? " + DNS" : "" %>, connection log: <%= d["egress"]["log"] %>"
 <% end -%>
 write_definition <%= d["name"] %> \
   '<%= Base64.strict_encode64(d["kube"]) %>' \
@@ -273,5 +305,17 @@ for dir in "$PODS_DEFS_DIR"/*/; do
     rm -rf "$dir"
   fi
 done
+
+# operator command (`bosh ssh`, `sudo -i`, `pods`)
+ln -sfn "$PODS_JOB_DIR/bin/pods" /usr/local/bin/pods
+<% if p("pods.shell_profile") -%>
+cat > /etc/profile.d/pods-bosh.sh << 'EOF'
+if [ -n "${BASH_VERSION:-}" ]; then
+  eval "$(/var/vcap/jobs/pods/bin/pods completion bash)"
+fi
+EOF
+<% else -%>
+rm -f /etc/profile.d/pods-bosh.sh
+<% end -%>
 
 log_info "--- ${SCRIPT_NAME} success"

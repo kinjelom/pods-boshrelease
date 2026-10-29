@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0 (2026-10-29)
+
+### Added
+
+- `pods`: egress connection log - `egress.log: none | blocked | all` per definition (default
+  `pods.defaults.egress_log: blocked`). The rules record connections in dynamic nftables sets (destination, protocol,
+  port, counter); every poll the supervisor moves them into `/var/vcap/sys/log/pods/<definition>/egress.log`, one line
+  per pod, verdict, protocol, destination and port (`blocked`: blocked packets, `all`: also every new allowed
+  connection, counted once per flow). No kernel logging (`nf_log_all_netns`) involved.
+  See [docs/details.md](docs/details.md#connection-log).
+- `pods` operator command (`/usr/local/bin/pods`, after `bosh ssh` + `sudo -i`): definitions with their monit
+  process, pods and containers; `ps`, `logs`, `exec`, `describe`, `egress`, `restart`, `kube` per definition,
+  bash completion in `/etc/profile.d/pods-bosh.sh` (`pods.shell_profile`, default true).
+
+### Changed
+
+- Definitions with `egress` now log blocked packets by default: set `egress.log: none` (or
+  `pods.defaults.egress_log: none`) for the 1.2.0 behavior.
+
 ## 1.2.0 (2026-10-29)
 
 ### Changed

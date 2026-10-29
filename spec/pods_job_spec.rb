@@ -121,13 +121,15 @@ describe 'pods job' do
     end
 
     describe 'egress' do
-      # renders the definition and returns [EGRESS_RULES, EGRESS_DNS] as sourced by bash
-      def egress(definition)
-        pre_start = render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => { 'app' => { 'manifest' => redis_pod }.merge(definition) } } })
+      # renders the definition and returns [EGRESS_RULES, EGRESS_DNS, EGRESS_LOG] as sourced by bash
+      def egress(definition, defaults = {})
+        pre_start = render('pods', 'bin/pre-start', { 'pods' => { 'defaults' => defaults, 'definitions' => {
+          'app' => { 'manifest' => redis_pod }.merge(definition),
+        } } })
         env = written_definitions(pre_start)['app']['env']
-        out, status = Open3.capture2('bash', '-c', env + "\nprintf '%s\\0%s' \"$EGRESS_RULES\" \"$EGRESS_DNS\"")
+        out, status = Open3.capture2('bash', '-c', env + "\nprintf '%s\\0%s\\0%s' \"$EGRESS_RULES\" \"$EGRESS_DNS\" \"$EGRESS_LOG\"")
         raise 'invalid definition.env' unless status.success?
-        out.split("\0", 2)
+        out.split("\0", 3)
       end
 
       def pod_with(spec_overrides = {}, container_overrides = {})
@@ -147,7 +149,7 @@ describe 'pods job' do
       end
 
       it 'renders an allowlist with drop/reset as the default' do
-        rules, dns = egress('egress' => { 'allow' => [
+        rules, dns, log = egress('egress' => { 'allow' => [
           { 'to' => '10.0.5.20', 'port' => 5432 },
           { 'to' => '10.0.6.7/24', 'protocol' => 'UDP', 'ports' => [514, '6000-6010', 514] },
           { 'to' => '2001:db8::/32', 'protocol' => 'all' },
@@ -155,6 +157,7 @@ describe 'pods job' do
           { 'to' => '0.0.0.0/0', 'port' => 443 },
         ] })
         expect(dns).to eq('false')
+        expect(log).to eq('blocked')
         expect(rules).to start_with("table inet pods_egress\ndelete table inet pods_egress\n")
         expect(rules).to include(
           'type filter hook output priority filter; policy drop;', 'oifname "lo" accept', 'ct state established,related accept',
@@ -169,7 +172,7 @@ describe 'pods job' do
       end
 
       it 'allows DNS through sets filled by the supervisor, an empty allowlist blocks everything else' do
-        rules, dns = egress('egress' => { 'allow' => [], 'dns' => true })
+        rules, dns, = egress('egress' => { 'allow' => [], 'dns' => true })
         expect(dns).to eq('true')
         expect(rules).to include('set dns4 { type ipv4_addr; }', 'ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept')
         expect(rules).not_to match(/daddr \d/)
@@ -180,7 +183,7 @@ describe 'pods job' do
       end
 
       it 'is off without the key' do
-        expect(egress({})).to eq(['', 'false'])
+        expect(egress({})).to eq(['', 'false', 'none'])
         pre_start = render('pods', 'bin/pre-start', { 'pods' => { 'definitions' => { 'app' => { 'manifest' => redis_pod } } } })
         expect(pre_start).not_to include('nsenter')
       end
@@ -190,7 +193,7 @@ describe 'pods job' do
           'app' => { 'manifest' => redis_pod, 'egress' => { 'allow' => [] } },
         } } })
         expect(bash_syntax_ok?(pre_start)).to be(true)
-        expect(pre_start).to include('for tool in nft nsenter; do', "definition 'app': egress restricted to 0 allow rule(s)")
+        expect(pre_start).to include('for tool in nft nsenter; do', "definition 'app': egress restricted to 0 allow rule(s), connection log: blocked")
       end
 
       it 'rejects invalid allow entries' do
@@ -207,7 +210,9 @@ describe 'pods job' do
         }.each do |entry, error|
           expect { egress('egress' => { 'allow' => [entry] }) }.to raise_error(error)
         end
-        expect { egress('egress' => { 'allow' => [], 'log' => true }) }.to raise_error(/egress: unknown key\(s\) log/)
+        expect { egress('egress' => { 'allow' => [], 'logs' => true }) }.to raise_error(/egress: unknown key\(s\) logs/)
+        expect { egress('egress' => { 'allow' => [], 'log' => true }) }.to raise_error(/egress.log: "true" is not none, blocked, all/)
+        expect { egress({ 'egress' => { 'allow' => [] } }, { 'egress_log' => 'some' }) }.to raise_error(/egress.log: "some" is not/)
         expect { egress('egress' => [{ 'to' => '10.0.0.1' }]) }.to raise_error(/egress: must be a hash/)
       end
 
@@ -221,6 +226,159 @@ describe 'pods job' do
         expect { egress('manifest' => pod_with({}, 'securityContext' => { 'capabilities' => { 'add' => ['cap_net_raw', 'CHOWN'] } }), 'egress' => allow_none) }
           .to raise_error(/container redis adds NET_RAW/)
         expect(egress('egress' => allow_none, 'play_flags' => ['--network', 'bridge']).first).to include('policy drop')
+      end
+
+      describe 'connection log' do
+        let(:allow) { [{ 'to' => '10.0.5.20', 'port' => 5432 }, { 'to' => '10.0.7.1', 'protocol' => 'icmp' }] }
+
+        # bin/egress-log.awk run by every awk of the host (the stemcell's awk is mawk)
+        def egress_log(listing)
+          awks = %w[mawk gawk].select { |awk| system("command -v #{awk} > /dev/null") }
+          awks = ['awk'] if awks.empty?
+          awks.map do |awk|
+            Dir.mktmpdir do |dir|
+              File.write(File.join(dir, 'egress-log.awk'), render('pods', 'bin/egress-log.awk', {}))
+              _out, err, status = Open3.capture3(awk, '-v', 'time=T', '-v', 'prefix=definition=app pod=app', '-v', 'logfile=egress.log',
+                                                 '-v', 'deletefile=delete.nft', '-f', 'egress-log.awk', stdin_data: listing, chdir: dir)
+              raise "#{awk} failed: #{err}" unless status.success?
+              read = ->(file) { File.exist?(File.join(dir, file)) ? File.read(File.join(dir, file)).lines.map(&:chomp).sort : [] }
+              [read.call('egress.log'), read.call('delete.nft')]
+            end
+          end
+        end
+
+        it 'records blocked packets by default, every new connection with log: all, nothing with log: none' do
+          blocked, = egress('egress' => { 'allow' => allow })
+          expect(blocked).to include(
+            'set blocked4 { type ipv4_addr . inet_proto . inet_service; size 4096; flags dynamic; }',
+            'set blocked6_noport { type ipv6_addr . inet_proto; size 4096; flags dynamic; }',
+            'meta nfproto ipv4 meta l4proto { tcp, udp } add @blocked4 { ip daddr . meta l4proto . th dport counter }',
+            'meta nfproto ipv6 meta l4proto != { tcp, udp } add @blocked6_noport { ip6 daddr . meta l4proto counter }',
+            'ip daddr 10.0.5.20 tcp dport { 5432 } accept'
+          )
+          expect(blocked.index('add @blocked4')).to be < blocked.index('reject with tcp reset')
+          expect(blocked).not_to include('allowed')
+
+          all, _dns, log = egress('egress' => { 'allow' => allow, 'dns' => true, 'log' => 'all' })
+          expect(log).to eq('all')
+          expect(all).to include(
+            'ip daddr 10.0.5.20 tcp dport { 5432 } goto allowed', 'ip daddr 10.0.7.1 meta l4proto icmp goto allowed',
+            'ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 goto allowed', 'add @blocked4',
+            "chain allowed {\n    ct mark 0x1 accept\n    ct mark set 0x1\n",
+            'add @allowed6_noport { ip6 daddr . meta l4proto counter }'
+          )
+
+          none, _dns, log = egress({ 'egress' => { 'allow' => allow } }, { 'egress_log' => 'none' })
+          expect(log).to eq('none')
+          expect(none).to include('ip daddr 10.0.5.20 tcp dport { 5432 } accept')
+          expect(none).not_to match(/ set |add @|allowed/)
+
+          [blocked, all, none].each do |rules|
+            skip 'nft in an unprivileged user namespace is not available' if nft_load(rules).nil?
+          end
+        end
+
+        it 'logs the listed elements (nft 1.0 and 1.1 output), deletes them and warns about a full set' do
+          listing = <<~NFT
+            table inet pods_egress {
+                set dns4 {
+                    type ipv4_addr
+                    elements = { 10.89.0.1 }
+                }
+
+                set allowed4 {
+                    type ipv4_addr . inet_proto . inet_service
+                    size 4096
+                    flags dynamic
+                    elements = { 10.0.6.7 . 17 . 514 counter packets 1 bytes 30,
+                                 10.0.5.20 . 6 . 5432 counter packets 2 bytes 120 }
+                }
+
+                set blocked4 {
+                    type ipv4_addr . inet_proto . inet_service
+                    size 4096
+                    flags dynamic
+                }
+
+                set blocked4_noport {
+                    type ipv4_addr . inet_proto
+                    size 2\t# count 2
+                    flags dynamic
+                    elements = { 10.0.7.2 . 1 counter packets 1 bytes 84, 10.0.7.3 . 47 counter packets 9 bytes 900 }
+                }
+
+                set blocked6 {
+                    type ipv6_addr . inet_proto . inet_service
+                    size 4096\t# count 1
+                    flags dynamic
+                    elements = { fd00::99 . 17 . 123 counter packets 1 bytes 50 }
+                }
+
+                chain output {
+                    type filter hook output priority filter; policy drop;
+                    meta l4proto { tcp, udp } add @blocked4 { ip daddr . meta l4proto . th dport counter }
+                }
+            }
+          NFT
+          egress_log(listing).each do |log, delete|
+            expect(log).to eq([
+              'T definition=app pod=app verdict=allowed proto=tcp dst=10.0.5.20 dport=5432 count=2',
+              'T definition=app pod=app verdict=allowed proto=udp dst=10.0.6.7 dport=514 count=1',
+              'T definition=app pod=app verdict=blocked proto=47 dst=10.0.7.3 count=9',
+              'T definition=app pod=app verdict=blocked proto=icmp dst=10.0.7.2 count=1',
+              'T definition=app pod=app verdict=blocked proto=udp dst=fd00::99 dport=123 count=1',
+              'T definition=app pod=app verdict=blocked warning="log set blocked4_noport full (2 destinations within one poll), further destinations not logged"',
+            ])
+            expect(delete).to eq([
+              'delete element inet pods_egress allowed4 { 10.0.6.7 . 17 . 514, 10.0.5.20 . 6 . 5432 }',
+              'delete element inet pods_egress blocked4_noport { 10.0.7.2 . 1, 10.0.7.3 . 47 }',
+              'delete element inet pods_egress blocked6 { fd00::99 . 17 . 123 }',
+            ])
+          end
+          expect(egress_log("table inet pods_egress {\n}\n")).to all(eq([[], []]))
+        end
+
+        # real traffic in a throw-away network namespace: new connections counted once, blocked packets each
+        # (lo carries the TCP resets back to the application)
+        it 'records real connections that the supervisor moves into egress.log' do
+          rules, = egress('egress' => { 'allow' => [
+            { 'to' => '10.0.5.20', 'port' => 5432 }, { 'to' => '10.0.6.0/24', 'protocol' => 'udp', 'port' => 514 },
+          ], 'log' => 'all' })
+          skip 'nft in an unprivileged user namespace is not available' if nft_load(rules).nil?
+          script = <<~'BASH'
+            set -e
+            ip link add d0 type dummy
+            ip addr add 10.0.0.2/8 dev d0
+            ip -6 addr add fd00::2/64 dev d0 nodad
+            ip link set d0 up
+            ip link set lo up
+            nft -f rules.nft
+            for i in 1 2 3; do (echo > /dev/tcp/10.0.9.5/443) 2> /dev/null || true; done
+            timeout 0.2 bash -c 'echo > /dev/tcp/10.0.5.20/5432' || true
+            exec 7> /dev/udp/10.0.6.7/514
+            for i in 1 2 3 4 5; do echo x >&7; done
+            exec 7>&-
+            (echo x > /dev/udp/fd00::99/123) 2> /dev/null || true
+          BASH
+          Dir.mktmpdir do |dir|
+            File.write(File.join(dir, 'rules.nft'), rules)
+            # the listing goes through the awk script between two nft calls, like in the supervisor
+            out, status = Open3.capture2e('unshare', '-rn', 'bash', '-c', script + 'nft -n list table inet pods_egress', chdir: dir)
+            skip "no network namespace with a dummy interface: #{out}" unless status.success?
+            log, delete = egress_log(out).first
+            expect(log.reject { |line| line.include?('dst=ff02::') }).to eq([
+              'T definition=app pod=app verdict=allowed proto=tcp dst=10.0.5.20 dport=5432 count=1',
+              'T definition=app pod=app verdict=allowed proto=udp dst=10.0.6.7 dport=514 count=1',
+              'T definition=app pod=app verdict=blocked proto=tcp dst=10.0.9.5 dport=443 count=3',
+              'T definition=app pod=app verdict=blocked proto=udp dst=fd00::99 dport=123 count=1',
+            ])
+            File.write(File.join(dir, 'delete.nft'), delete.join("\n") + "\n")
+            out, status = Open3.capture2e('unshare', '-rn', 'bash', '-c',
+                                          script + "nft -f delete.nft\nnft -n list table inet pods_egress | grep -c 'elements = ' || true", chdir: dir)
+            expect(status.success?).to be(true), out
+            expect(out.strip).to eq('0')
+          end
+        end
       end
     end
 
@@ -299,9 +457,33 @@ describe 'pods job' do
     end
   end
 
+  describe 'bin/pods' do
+    it 'is linked into /usr/local/bin with an optional bash completion' do
+      props = ->(profile) { { 'pods' => { 'shell_profile' => profile, 'definitions' => { 'redis' => { 'manifest' => redis_pod } } } } }
+      pre_start = render('pods', 'bin/pre-start', props.call(true))
+      expect(pre_start).to include('ln -sfn "$PODS_JOB_DIR/bin/pods" /usr/local/bin/pods',
+                                   'eval "$(/var/vcap/jobs/pods/bin/pods completion bash)"')
+      expect(render('pods', 'bin/pre-start', props.call(false))).to include('rm -f /etc/profile.d/pods-bosh.sh')
+    end
+
+    it 'prints its usage and the bash completion without the job environment' do
+      Dir.mktmpdir do |dir|
+        pods = File.join(dir, 'pods')
+        File.write(pods, render('pods', 'bin/pods', {}))
+        out, status = Open3.capture2('bash', pods, 'help')
+        expect(status.success?).to be(true)
+        expect(out).to include('Usage: pods', 'logs     <definition> [-c <container>]')
+        completion, status = Open3.capture2('bash', pods, 'completion', 'bash')
+        expect(status.success?).to be(true)
+        expect(bash_syntax_ok?(completion)).to be(true)
+        expect(completion).to include('complete -F _pods_complete pods')
+      end
+    end
+  end
+
   it 'renders syntactically valid scripts' do
     props = { 'pods' => { 'definitions' => { 'redis' => { 'manifest' => redis_pod } } } }
-    %w[bin/pre-start bin/post-start bin/drain bin/pod-ctl bin/pod-supervisor bin/pods-env.sh].each do |template|
+    %w[bin/pre-start bin/post-start bin/drain bin/pod-ctl bin/pod-supervisor bin/pods-env.sh bin/pods].each do |template|
       expect(bash_syntax_ok?(render('pods', template, props))).to be(true)
     end
   end

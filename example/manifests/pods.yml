@@ -30,8 +30,9 @@ instance_groups:
           pods:
             definitions:
               redis:
-                # no outbound connections at all, clients of the hostPort are still served
-                egress: { allow: [ ] }
+                # no outbound connections at all, clients of the hostPort are still served;
+                # blocked attempts go to /var/vcap/sys/log/pods/redis/egress.log
+                egress: { allow: [ ], log: blocked }
                 manifest:
                   - apiVersion: v1
                     kind: ConfigMap

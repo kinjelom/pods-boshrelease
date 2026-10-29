@@ -14,6 +14,8 @@ templates:
   bin/pods-env.sh: bin/pods-env.sh
   bin/pod-ctl.sh: bin/pod-ctl
   bin/pod-supervisor.sh: bin/pod-supervisor
+  bin/egress-log.awk: bin/egress-log.awk
+  bin/pods.sh: bin/pods
 
 packages:
 - podman
@@ -44,6 +46,8 @@ properties:
                            allow: list of { to: IP or CIDR, protocol: tcp (default) | udp | icmp | all,
                                             port: 443 or ports: [80, "8000-8100"] (tcp/udp only, required) }
                            dns:   true = also DNS (port 53) to the pod's nameservers (default false)
+                           log:   connection log in /var/vcap/sys/log/pods/<name>/egress.log (default
+                                  pods.defaults.egress_log): none | blocked | all (every new connection)
                          Replies to inbound connections (hostPort) are always allowed; `allow: []` blocks all
                          outbound connections. Not for hostNetwork pods; privileged containers and NET_ADMIN,
                          NET_RAW or SYS_ADMIN capabilities are rejected. Needs nft and nsenter on the stemcell.
@@ -54,6 +58,7 @@ properties:
       redis:
         egress:
           allow: []   # no outbound connections, clients of the hostPort are still served
+          log: blocked
         manifest:
         - apiVersion: v1
           kind: Pod
@@ -93,6 +98,22 @@ properties:
       securityContext.runAsUser (container or pod level; group: runAsGroup, then fsGroup, then the uid),
       runs `chown -R uid:gid` on it - only when the directory's current owner differs.
       Images with a non-root USER (e.g. 13001) just need `securityContext: { runAsUser: 13001, runAsGroup: 13001 }`.
+    default: true
+
+  pods.defaults.egress_log:
+    description: |
+      Default `egress.log` of a definition with `egress`: which outbound connections the supervisor writes to
+      /var/vcap/sys/log/pods/<name>/egress.log every poll (one line per verdict, protocol, destination and port
+      with the number of new connections / blocked packets since the previous line):
+        none:    no connection log
+        blocked: connections blocked by the egress rules
+        all:     every new outbound connection, allowed and blocked (audit)
+    default: blocked
+
+  pods.shell_profile:
+    description: |
+      Bash completion of the `pods` operator command (/usr/local/bin/pods: definitions, their pods, logs,
+      exec, egress) in /etc/profile.d/pods-bosh.sh
     default: true
 
   pods.host_paths.allowed_prefixes:
