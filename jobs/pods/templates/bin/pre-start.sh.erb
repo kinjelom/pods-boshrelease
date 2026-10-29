@@ -21,12 +21,93 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
   require 'yaml'
   require 'base64'
   require 'shellwords'
+  require 'ipaddr'
 
   pod_kinds = %w(Pod Deployment DaemonSet)
   supported_kinds = pod_kinds + %w(ConfigMap Secret PersistentVolumeClaim)
 
   bash_array = lambda { |values| "(" + Array(values).map { |v| Shellwords.escape(v.to_s) }.join(" ") + ")" }
   setting = lambda { |definition, key| definition.key?(key) ? definition[key] : p("pods.defaults.#{key}") }
+
+  # egress: nftables script loaded by the supervisor into each pod's network namespace before its containers
+  # start. Only the listed destinations, loopback, replies (e.g. to clients of a hostPort) and IPv6 neighbor
+  # discovery leave the pod; the dns sets are filled at runtime from the pod's resolv.conf.
+  # A container able to bypass the rules (NET_ADMIN flushes them, NET_RAW sends packets around them) is rejected.
+  bypass_caps = %w(NET_ADMIN NET_RAW SYS_ADMIN ALL)
+  egress_rules = lambda do |where, egress, documents, play_flags|
+    raise "#{where}: must be a hash (allow, dns)" unless egress.is_a?(Hash)
+    unknown = egress.keys.map(&:to_s) - %w(allow dns)
+    raise "#{where}: unknown key(s) #{unknown.join(", ")}" unless unknown.empty?
+    raise "#{where}.allow: must be a list" unless egress["allow"].nil? || egress["allow"].is_a?(Array)
+    raise "#{where}.dns: must be true or false" unless [nil, true, false].include?(egress["dns"])
+
+    documents.select { |doc| pod_kinds.include?(doc["kind"]) }.each do |doc|
+      object = "#{doc["kind"]}/#{doc["metadata"]["name"]}"
+      spec = (doc["kind"] == "Pod" ? doc["spec"] : doc.dig("spec", "template", "spec")) || {}
+      raise "#{where}: #{object} uses hostNetwork, egress needs the pod's own network namespace" if spec["hostNetwork"]
+      (Array(spec["initContainers"]) + Array(spec["containers"])).each do |container|
+        context = container["securityContext"] || {}
+        raise "#{where}: #{object} container #{container["name"]} is privileged, it could bypass the egress rules" if context["privileged"]
+        caps = Array(context.dig("capabilities", "add")).map { |cap| cap.to_s.upcase.delete_prefix("CAP_") } & bypass_caps
+        raise "#{where}: #{object} container #{container["name"]} adds #{caps.join(", ")}, it could bypass the egress rules" unless caps.empty?
+      end
+    end
+    flags = Array(play_flags).map(&:to_s)
+    flags.each_with_index do |flag, i|
+      network = flag[/\A--net(?:work)?=(.*)\z/, 1] || (%w(--net --network).include?(flag) ? flags[i + 1].to_s : nil)
+      raise "#{where}: play_flags use the network '#{network}', egress needs the pods' own network namespace" if
+        network && (network == "host" || network.start_with?("ns:", "container:"))
+    end
+
+    rules = Array(egress["allow"]).each_with_index.map do |entry, i|
+      at = "#{where}.allow[#{i}]"
+      raise "#{at}: must be a hash (to, protocol, port/ports)" unless entry.is_a?(Hash)
+      unknown = entry.keys.map(&:to_s) - %w(to protocol port ports)
+      raise "#{at}: unknown key(s) #{unknown.join(", ")}" unless unknown.empty?
+      to = begin
+        raise IPAddr::InvalidAddressError if entry["to"].to_s.include?("%") # zone ids (fe80::1%eth0): not for nft
+        IPAddr.new(entry["to"].to_s)
+      rescue IPAddr::Error
+        raise "#{at}.to: \"#{entry["to"]}\" is not an IP address or CIDR (host names are not resolved)"
+      end
+      daddr = (to.ipv4? ? "ip" : "ip6") + " daddr " + (entry["to"].to_s.include?("/") ? "#{to}/#{to.prefix}" : to.to_s)
+      raise "#{at}: use either port or ports" if entry.key?("port") && entry.key?("ports")
+      ports = Array(entry["ports"] || entry["port"]).map do |port|
+        from, upto = port.to_s.split("-", 2)
+        valid = [from, upto || from].all? { |n| n =~ /\A\d+\z/ && n.to_i.between?(1, 65535) } && from.to_i <= (upto || from).to_i
+        raise "#{at}: invalid port \"#{port}\" (1-65535 or a range like 8000-8100)" unless valid
+        port.to_s
+      end
+      protocol = (entry["protocol"] || "tcp").to_s.downcase
+      case protocol
+      when "tcp", "udp"
+        raise "#{at}: port or ports required for #{protocol} (all ports: 1-65535)" if ports.empty?
+        "#{daddr} #{protocol} dport { #{ports.uniq.join(", ")} } accept"
+      when "icmp", "all"
+        raise "#{at}: protocol #{protocol} takes no ports" unless ports.empty?
+        protocol == "all" ? "#{daddr} accept" : "#{daddr} meta l4proto #{to.ipv4? ? "icmp" : "ipv6-icmp"} accept"
+      else
+        raise "#{at}.protocol: \"#{protocol}\" is not tcp, udp, icmp or all"
+      end
+    end
+
+    dns = egress["dns"] == true
+    lines = ["table inet pods_egress", "delete table inet pods_egress", "table inet pods_egress {"]
+    lines += ["  set dns4 { type ipv4_addr; }", "  set dns6 { type ipv6_addr; }"] if dns
+    lines += [
+      "  chain output {",
+      "    type filter hook output priority filter; policy drop;",
+      "    oifname \"lo\" accept",
+      "    ct state established,related accept",
+      "    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept",
+    ]
+    lines += ["    ip daddr @dns4 meta l4proto { tcp, udp } th dport 53 accept",
+              "    ip6 daddr @dns6 meta l4proto { tcp, udp } th dport 53 accept"] if dns
+    lines += rules.map { |rule| "    #{rule}" }
+    # a dropped SYN would leave connect() retrying for minutes, a reset fails it at once (other packets: EPERM)
+    lines += ["    meta l4proto tcp counter reject with tcp reset", "    counter drop", "  }", "}"]
+    { "script" => lines.join("\n") + "\n", "dns" => dns, "rules" => rules.size }
+  end
 
   host_path_prefixes = Array(p("pods.host_paths.allowed_prefixes")).map { |prefix| prefix.to_s.end_with?("/") ? prefix.to_s : "#{prefix}/" }
   # below an allowed prefix (never the prefix itself) and without ".." components
@@ -117,13 +198,16 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       owners[path] = { "owner" => owner, "create" => true, "from" => "host_path_owners" }
     end
 
+    play_flags = setting.call(definition, "play_flags")
+    egress = definition["egress"].nil? ? nil : egress_rules.call("#{where}.egress", definition["egress"], kept, play_flags)
+
     header = ["# pods-boshrelease definition: #{name}"]
     header << "# dropped (unsupported by podman kube play): " + dropped.map { |d| "#{d["kind"]}/#{d["metadata"]["name"]}" }.join(", ") unless dropped.empty?
     kube = header.join("\n") + "\n" + kept.map(&:to_yaml).join
 
     env = <<~ENV
       POD_NAMES=#{bash_array.call(pods)}
-      PLAY_FLAGS=#{bash_array.call(setting.call(definition, "play_flags"))}
+      PLAY_FLAGS=#{bash_array.call(play_flags)}
       FOLLOW_LOGS=#{Shellwords.escape(setting.call(definition, "follow_logs").to_s)}
       WAIT_HEALTHY=#{Shellwords.escape(setting.call(definition, "wait_healthy").to_s)}
       START_TIMEOUT=#{Integer(setting.call(definition, "start_timeout"))}
@@ -131,13 +215,26 @@ source /var/vcap/jobs/pods/bin/pods-env.sh
       POLL_INTERVAL=#{Integer(p("pods.supervisor.poll_interval"))}
       HOST_PATH_OWNERS=#{bash_array.call(owners.map { |path, o| "#{path}|#{o["owner"]}|#{o["create"]}" })}
       HOST_PATH_PREFIXES=#{bash_array.call(host_path_prefixes)}
+      EGRESS_RULES=#{egress ? Shellwords.escape(egress["script"]) : "''"}
+      EGRESS_DNS=#{egress && egress["dns"] ? "true" : "false"}
     ENV
 
-    { "name" => name, "kube" => kube, "env" => env, "pods" => pods, "dropped" => dropped.size, "owners" => owners }
+    { "name" => name, "kube" => kube, "env" => env, "pods" => pods, "dropped" => dropped.size, "owners" => owners, "egress" => egress }
   end
 -%>
 mkdir -p "$PODS_DEFS_DIR" "$PODS_RUN_DIR"
 chmod 0700 "$(dirname "$PODS_DEFS_DIR")" "$PODS_DEFS_DIR"
+
+<% if definitions.any? { |d| d["egress"] } -%>
+# egress rules are loaded with the stemcell's nft into the pods' network namespaces
+for tool in nft nsenter; do
+  if ! command -v "$tool" > /dev/null 2>&1; then
+    log_error "egress is configured but the $tool binary is missing on the stemcell"
+    exit 1
+  fi
+done
+
+<% end -%>
 
 # write_definition <name> <kube.yml base64> <definition.env base64>
 write_definition() {
@@ -156,6 +253,9 @@ DEFINITIONS=(<%= definitions.map { |d| d["name"] }.join(" ") %>)
 log_info "definition '<%= d["name"] %>': pods <%= d["pods"].join(", ") %><%= d["dropped"] > 0 ? " (#{d["dropped"]} unsupported object(s) dropped, see kube.yml header)" : "" %>"
 <% d["owners"].each do |path, o| -%>
 log_info <%= Shellwords.escape("definition '#{d["name"]}': hostPath #{path} owned by #{o["owner"]} (#{o["from"]})") %>
+<% end -%>
+<% if d["egress"] -%>
+log_info "definition '<%= d["name"] %>': egress restricted to <%= d["egress"]["rules"] %> allow rule(s)<%= d["egress"]["dns"] ? " + DNS" : "" %>"
 <% end -%>
 write_definition <%= d["name"] %> \
   '<%= Base64.strict_encode64(d["kube"]) %>' \

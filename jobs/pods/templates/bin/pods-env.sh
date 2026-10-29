@@ -10,7 +10,7 @@ source /var/vcap/jobs/podman/bin/podman-env.sh
 source /var/vcap/packages/common/script_utils.sh
 
 # pods_load_definition <name>: sets PODS_DEF_* paths and sources definition.env
-# (POD_NAMES, PLAY_FLAGS, FOLLOW_LOGS, WAIT_HEALTHY, START_TIMEOUT, STOP_TIMEOUT, POLL_INTERVAL)
+# (POD_NAMES, PLAY_FLAGS, FOLLOW_LOGS, WAIT_HEALTHY, START_TIMEOUT, STOP_TIMEOUT, POLL_INTERVAL, HOST_PATH_*, EGRESS_*)
 function pods_load_definition() {
   PODS_DEF_NAME=$1
   PODS_DEF_DIR="$PODS_DEFS_DIR/$1"

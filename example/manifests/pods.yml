@@ -30,6 +30,8 @@ instance_groups:
           pods:
             definitions:
               redis:
+                # no outbound connections at all, clients of the hostPort are still served
+                egress: { allow: [ ] }
                 manifest:
                   - apiVersion: v1
                     kind: ConfigMap

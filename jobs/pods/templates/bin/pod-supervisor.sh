@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Supervises one pod definition (the process monit watches):
 #  - plays the Kubernetes YAML with `podman kube play --replace`,
+#  - with egress rules: creates the pods stopped, starts each infra container (it holds the pod's network
+#    namespace), loads the rules into that namespace and only then starts the other (init) containers;
+#    reloads them when the infra container gets restarted behind the supervisor's back,
 #  - exits when a pod disappears or its infra container stops, so monit restarts the whole definition,
 #  - follows container output into /var/vcap/sys/log/pods/<definition>/<container>.log,
 #  - runs container healthchecks (livenessProbe/startupProbe): the static podman build has no systemd
@@ -24,6 +27,7 @@ declare -A HC_STARTUP=()   # container -> startupProbe interval (s), 0 = none
 declare -A HC_LIVENESS=()  # container -> livenessProbe interval (s), 0 = none
 declare -A HC_NEXT=()      # container -> next probe (epoch s)
 declare -A HC_PID=()       # container -> running `podman healthcheck run` pid
+declare -A EGRESS_PID=()   # pod -> pid of the infra container whose network namespace has the egress rules
 CHILD_PID=""
 
 function stop_followers() {
@@ -43,6 +47,14 @@ function shutdown() {
   exit 0
 }
 trap shutdown TERM INT
+
+# fail_closed <reason>: the pods must not run without their egress rules
+function fail_closed() {
+  log_error "$1, tearing down the pods of '$NAME', monit will retry"
+  podman kube down "$PODS_KUBE_FILE" || log_warn "kube down of '$NAME' failed"
+  stop_followers
+  exit 1
+}
 
 # run_podman <output file|-> <args...>: runs podman interruptibly ("-": output goes to the supervisor
 # logs), returns its exit code
@@ -144,18 +156,85 @@ function prepare_host_paths() {
   done
 }
 
+# egress_apply <pod> <infra container>: loads EGRESS_RULES (with EGRESS_DNS also the nameservers of the pod's
+# resolv.conf) into the network namespace of the running infra container, in one nft transaction
+function egress_apply() {
+  local pod=$1 infra=$2 pid resolv servers="" server
+  run_podman "$WORK_DIR/egress" inspect "$infra" --format '{{.State.Pid}}|{{.ResolvConfPath}}' || return 1
+  IFS='|' read -r pid resolv < "$WORK_DIR/egress"
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "the infra container of pod '$pod' is not running"
+    return 1
+  fi
+  # never touch the host firewall (pre-start rejects hostNetwork, this also catches e.g. a raw network mode)
+  if [[ "$(readlink "/proc/$pid/ns/net")" == "$(readlink /proc/1/ns/net)" ]]; then
+    log_error "pod '$pod' shares the host network namespace, egress rules cannot be applied"
+    return 1
+  fi
+  if [[ "$EGRESS_DNS" == "true" ]]; then
+    servers=$(awk '$1 == "nameserver" && $2 ~ /^[0-9A-Fa-f.:]+$/ { print $2 }' "$resolv" | paste -sd ' ')
+    [[ -n "$servers" ]] || log_warn "no nameserver found in the resolv.conf of pod '$pod' ($resolv), DNS stays blocked"
+  fi
+  if ! {
+    printf '%s' "$EGRESS_RULES"
+    for server in $servers; do
+      echo "add element inet pods_egress $([[ "$server" == *:* ]] && echo dns6 || echo dns4) { $server }"
+    done
+  } | nsenter --target "$pid" --net nft -f -; then
+    log_error "loading the egress rules into pod '$pod' failed"
+    return 1
+  fi
+  EGRESS_PID[$pod]=$pid
+  log_info "egress rules loaded into pod '$pod' (infra pid $pid${servers:+, nameservers: $servers})"
+}
+
+# start_egress_pod <pod>: starts a pod created stopped - the infra container first (it creates the network
+# namespace), then, once the rules are loaded, the (init) containers. Containers able to bypass the rules
+# (privileged, NET_ADMIN, NET_RAW, SYS_ADMIN - also when granted by default_capabilities) are refused.
+function start_egress_pod() {
+  local pod=$1 ctr is_infra infra="" others=()
+  run_podman "$WORK_DIR/egress-ps" ps --all --filter "pod=$pod" --format '{{.Names}}|{{.IsInfra}}' || return 1
+  while IFS='|' read -r ctr is_infra; do
+    [[ -n "$ctr" ]] || continue
+    if [[ "$is_infra" == "true" ]]; then infra=$ctr; else others+=("$ctr"); fi
+  done < "$WORK_DIR/egress-ps"
+  if [[ -z "$infra" ]]; then
+    log_error "pod '$pod' has no infra container"
+    return 1
+  fi
+  if ((${#others[@]} > 0)); then
+    run_podman "$WORK_DIR/egress-caps" inspect --format '{{.Name}}|{{.BoundingCaps}}' "${others[@]}" || return 1
+    if grep -E 'CAP_(NET_ADMIN|NET_RAW|SYS_ADMIN)\b' "$WORK_DIR/egress-caps" > "$WORK_DIR/egress-bypass"; then
+      log_error "containers of pod '$pod' could bypass the egress rules: $(cut -d'|' -f1 "$WORK_DIR/egress-bypass" | paste -sd ' ')"
+      return 1
+    fi
+  fi
+  run_podman "$WORK_DIR/egress-start" start "$infra" || return 1
+  egress_apply "$pod" "$infra" || return 1
+  run_podman - pod start "$pod"
+}
+
 prepare_host_paths
 
+# with egress rules the pods are created stopped and started by start_egress_pod
+EGRESS_PLAY_FLAGS=()
+[[ -z "$EGRESS_RULES" ]] || EGRESS_PLAY_FLAGS=(--start=false)
+
 log_info "playing $PODS_KUBE_FILE (pods: ${POD_NAMES[*]})"
-if ! run_podman - kube play --replace --log-driver k8s-file "${PLAY_FLAGS[@]}" "$PODS_KUBE_FILE"; then
+if ! run_podman - kube play --replace --log-driver k8s-file "${EGRESS_PLAY_FLAGS[@]}" "${PLAY_FLAGS[@]}" "$PODS_KUBE_FILE"; then
   log_error "podman kube play failed, monit will retry"
   exit 1
+fi
+if [[ -n "$EGRESS_RULES" ]]; then
+  for pod in "${POD_NAMES[@]}"; do
+    start_egress_pod "$pod" || fail_closed "pod '$pod' could not be started with its egress rules"
+  done
 fi
 log_info "pods of '$NAME' created"
 
 while true; do
   for pod in "${POD_NAMES[@]}"; do
-    run_podman "$WORK_DIR/ps" ps --all --filter "pod=$pod" --format '{{.Names}}|{{.IsInfra}}|{{.State}}|{{.Status}}' || continue
+    run_podman "$WORK_DIR/ps" ps --all --filter "pod=$pod" --format '{{.Names}}|{{.IsInfra}}|{{.State}}|{{.Status}}|{{.Pid}}' || continue
 
     if ! grep -q '|true|running|' "$WORK_DIR/ps"; then
       log_error "pod '$pod' is gone or stopped ($(tr '\n' ' ' < "$WORK_DIR/ps")), exiting so that monit restarts '$NAME'"
@@ -163,8 +242,16 @@ while true; do
       exit 1
     fi
 
-    while IFS='|' read -r ctr infra state status; do
-      [[ -z "$ctr" || "$infra" == "true" ]] && continue
+    while IFS='|' read -r ctr infra state status pid; do
+      [[ -z "$ctr" ]] && continue
+      if [[ "$infra" == "true" ]]; then
+        # restarted outside of the supervisor (e.g. `podman pod restart`): its new network namespace has no rules
+        if [[ -n "$EGRESS_RULES" && "$pid" != "${EGRESS_PID[$pod]:-}" ]]; then
+          log_warn "the infra container of pod '$pod' was restarted (pid ${EGRESS_PID[$pod]:-?} -> $pid), reloading the egress rules"
+          egress_apply "$pod" "$ctr" || fail_closed "the egress rules of pod '$pod' could not be reloaded"
+        fi
+        continue
+      fi
       if [[ "$FOLLOW_LOGS" == "true" ]] && ! pid_alive "${FOLLOWERS[$ctr]:-}"; then
         follow_logs "$ctr"
       fi

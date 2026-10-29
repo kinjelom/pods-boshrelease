@@ -5,6 +5,7 @@
 * [Logs](#logs)
 * [Metrics](#metrics)
 * [Persistent data](#persistent-data)
+* [Egress (outbound traffic)](#egress-outbound-traffic)
 * [Configuration](#configuration)
 * [Operating](#operating)
 * [Known limitations / notes](#known-limitations--notes)
@@ -14,6 +15,7 @@
 ```
 monit ─ pod-ctl start <def> ─ setsid pod-supervisor <def>           (monit watches the supervisor pid)
                                 ├─ podman kube play --replace kube.yml
+                                │    with egress: --start=false → start infra → nft rules in its netns → podman pod start
                                 ├─ poll `podman ps` every pods.supervisor.poll_interval seconds
                                 │    pod gone / infra container stopped → exit → monit restarts the definition
                                 ├─ tail -F <container k8s-file log> >> /var/vcap/sys/log/pods/<def>/<container>.log
@@ -121,6 +123,52 @@ interval >= 30s.
 * `PersistentVolumeClaim` - a podman named volume under `podman.data_dir` (persistent disk if present).
   Never removed by this release (`kube play --wait` is deliberately not used: its teardown deletes PVC volumes).
 
+### Egress (outbound traffic)
+
+`egress` restricts what the pods of a definition may connect to. Everything not listed is blocked:
+
+```yaml
+pods:
+  definitions:
+    app:
+      egress:
+        allow:
+          - { to: 10.0.5.20, port: 5432 }                         # protocol: tcp (default)
+          - { to: 10.0.6.0/24, protocol: udp, ports: [ 514, "6000-6010" ] }
+          - { to: 10.0.7.1, protocol: icmp }
+          - { to: "2001:db8::/32", protocol: all }                 # any protocol and port
+        dns: true           # port 53 to the pod's nameservers (default false: names do not resolve)
+      manifest: [ ... ]
+```
+
+* `to`: an IPv4/IPv6 address or CIDR (host names are not resolved), `protocol`: `tcp` | `udp` | `icmp` | `all`,
+  `port`/`ports`: required for tcp/udp, numbers or ranges. `allow: []` blocks every outbound connection.
+* Always allowed: loopback (containers of the same pod), replies to inbound connections (clients of a `hostPort`,
+  other pods), IPv6 neighbor discovery. Inbound traffic is not filtered.
+* The rules apply to everything leaving the pod: the internet, other pods, the VM itself (its IPs, the bridge
+  gateway). A blocked TCP connection is refused (reset), other blocked packets fail with `Operation not permitted`.
+* `dns: true` allows DNS to the nameservers podman wrote into the pod's `/etc/resolv.conf` (aardvark-dns on the
+  network gateway, or the VM's resolvers), so any name can be resolved, but only the listed addresses reached.
+
+How: an nftables table `inet pods_egress` (output hook, default drop) in each pod's network namespace, loaded
+with the stemcell's `nft` through `nsenter`. The supervisor creates the pods stopped (`kube play --start=false`),
+starts the infra container (it owns the network namespace), loads the rules and only then starts the other
+containers - init containers included - so no container ever runs without them. If the rules cannot be loaded,
+the pods are torn down (monit retries, post-start fails the deploy).
+
+The rules hold as long as no container can change or get around them. Pre-start rejects `hostNetwork`,
+`play_flags` with `--network host` (or `ns:`/`container:`), `privileged` containers and added `NET_ADMIN`,
+`NET_RAW`, `SYS_ADMIN` or `ALL` capabilities. Before the start, the supervisor also checks each container's
+bounding capabilities, so these capabilities are caught even when they come from
+`podman.raw_config.containers_conf` (`default_capabilities`).
+
+Inspect the rules and the counters of blocked packets:
+
+```bash
+pid=$(podman ps --filter pod=<pod> --format '{{.IsInfra}} {{.Pid}}' | awk '$1 == "true" { print $2 }')
+nsenter --target "$pid" --net nft list table inet pods_egress
+```
+
 ### Configuration
 
 Each podman config file is generated from properties and can be extended/overridden with a raw hash that is
@@ -150,6 +198,9 @@ cat /var/vcap/data/pods/definitions/<def>/kube.yml
 * Netavark (Podman 6) only supports the `nftables` firewall driver - the `nft` binary must exist on the stemcell
   for bridge networking (`podman.network.firewall_driver: none` + `hostNetwork` otherwise).
 * Definitions are meant for long-running services: a pod whose infra container stops is replayed by monit.
+* Egress rules live in the pod's network namespace. A pod restarted by hand (`podman pod restart`, `podman start`)
+  gets a new namespace: the supervisor reloads the rules on its next poll, so for up to `poll_interval` seconds
+  the pod is unrestricted. Restart definitions with `monit restart pod-<definition>` instead.
 * Stateful services (databases): give them a `terminationGracePeriodSeconds` long enough for a stop under load
   (migrations, compaction) - SIGKILL after the grace period is an unclean shutdown. Long grace periods are only
   safe through the drain: avoid `bosh stop/recreate --skip-drain`, BOSH stops waiting for `monit stop` after 5 minutes.
