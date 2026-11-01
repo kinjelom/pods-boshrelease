@@ -7,6 +7,17 @@ Every pod definition is a separate monit process; container output goes to `/var
 
 Requires an **`ubuntu-noble`** stemcell (cgroup v2).
 
+### Architecture
+
+![Architecture of the pods BOSH release](docs/architecture.png)
+
+1. **pre-start** renders every entry of `pods.definitions` (Kubernetes YAML) into a `kube.yml`.
+2. **monit** runs one `pod-supervisor` per definition: `podman kube play`, egress rules loaded before the containers
+   start, container logs copied to `/var/vcap/sys/log`, probes; a pod that is gone is replayed.
+3. **post-start** waits until the pods are running and healthy; **drain** stops them gracefully.
+
+ArchiMate model (open with [Archi](https://www.archimatetool.com/)): [docs/architecture.archimate](docs/architecture.archimate).
+
 ### Jobs
 
 | Job               | Purpose                                                                                                |
