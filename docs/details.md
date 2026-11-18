@@ -166,7 +166,7 @@ pods:
       egress:
         allow:
           - { to: 10.0.5.20, port: 5432 }                         # protocol: tcp (default)
-          - { to: 10.0.6.0/24, protocol: udp, ports: [ 514, "6000-6010" ] }
+          - { to: 10.0.6.0/24, protocol: udp, ports: [ "514", "6000-6010" ] }
           - { to: 10.0.7.1, protocol: icmp }
           - { to: "2001:db8::/32", protocol: all }                 # any protocol and port
         dns: true           # port 53 to the pod's nameservers (default false: names do not resolve)
