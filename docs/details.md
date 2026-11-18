@@ -105,6 +105,37 @@ scrapes hang until `Limit of concurrent requests reached` - and corrupts the loc
 Every scrape lists containers and pods through the API, taking the same locks as `podman ps`: keep the scrape
 interval >= 30s.
 
+### Podman API for pods
+
+The `podman-api` job runs `podman system service` (libpod and Docker-compatible REST API) on
+`<podman_api.socket_dir>/podman.sock` (default `/var/vcap/sys/run/podman-api`), monit process `podman-api`, logs in
+`/var/vcap/sys/log/podman-api/`. A pod that starts containers itself (a CI or workflow engine, `podman --remote`,
+docker CLI with `DOCKER_HOST`) mounts the **directory** - the socket file is replaced on every restart of the service:
+
+```yaml
+- name: podman-api
+  release: pods
+  properties:
+    podman_api:
+      group_gid: 2375        # socket 0660 root:2375, directory 0750; empty = root only (0700/0600)
+# in the Pod spec:
+securityContext: { supplementalGroups: [ 2375 ] }   # pod level - ignored on a container
+volumes:
+  - { name: podman-api, hostPath: { path: /var/vcap/sys/run/podman-api, type: Directory } }
+containers:
+  - env: [ { name: CONTAINER_HOST, value: unix:///run/podman/podman.sock } ]
+    securityContext: { runAsUser: 1000 }
+    volumeMounts: [ { name: podman-api, mountPath: /run/podman } ]
+```
+
+* The socket is **root-equivalent**: a client can start privileged containers and bind-mount any host path. Use the
+  job on dedicated instances, for trusted clients only.
+* Containers started through the API are not part of a `pods` definition: no supervisor, no egress rules, no log copy.
+  Bind mounts in such containers use **host paths**: a client that passes its own files to them must see them under
+  the same path (mount the hostPath at an identical `mountPath`).
+* The client needs no podman installation: the static `/var/vcap/packages/podman/bin/podman` works as
+  `podman --remote` in any container (hostPath file mount).
+
 ### Persistent data
 
 * `hostPath` under `/var/vcap/store/...` - explicit and recommended.
@@ -221,7 +252,7 @@ pods logs <def> [-c <container>] -f --tail 100
 pods exec <def> [-c <container>] [-- <command>]
 pods describe <def>                # settings, files, containers; also: ps, egress, restart, kube (pods help)
 podman ps --pod                    # PATH, auth and bash completion come from /etc/profile.d/podman-bosh.sh
-monit summary                      # pod-<definition>, podman-exporter-api, podman-exporter processes
+monit summary                      # pod-<definition>, podman-exporter-api, podman-exporter, podman-api processes
 ```
 
 `pods` (`/usr/local/bin/pods`, root only) is a kubectl-like view of the definitions of the VM on top of podman and

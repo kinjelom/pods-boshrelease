@@ -1,0 +1,6 @@
+# monit 5.2.5 https://gist.github.com/oppegard/46dfa1e40b46aff1fa73c81b10341cab
+check process podman-api
+  with pidfile /var/vcap/sys/run/podman-api/podman-api.pid
+  start program "/var/vcap/jobs/podman-api/bin/ctl start" with timeout 40 seconds
+  stop program "/var/vcap/jobs/podman-api/bin/ctl stop" with timeout 60 seconds
+  group vcap

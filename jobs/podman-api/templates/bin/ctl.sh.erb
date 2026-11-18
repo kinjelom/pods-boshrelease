@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# monit start/stop program of the podman API service: ctl {start|stop}
+set -euo pipefail
+<% require 'shellwords' -%>
+
+ACTION=${1:-}
+
+# pid file: fixed path of the monit check; the socket directory is configurable
+RUN_DIR=/var/vcap/sys/run/podman-api
+LOG_DIR=/var/vcap/sys/log/podman-api
+SOCKET_DIR=<%= Shellwords.escape(p("podman_api.socket_dir")) %>
+SOCKET="$SOCKET_DIR/podman.sock"
+<%
+  gid = p("podman_api.group_gid", nil)
+  unless gid.nil? || gid.to_s.empty?
+    raise "podman_api.group_gid must be a numeric GID, got #{gid.inspect}" unless gid.to_s =~ /\A\d+\z/
+  end
+-%>
+GROUP_GID=<%= gid.to_s %>
+
+PID_FILE="$RUN_DIR/podman-api.pid"
+OUT_LOG="$LOG_DIR/podman-api.stdout.log"
+ERR_LOG="$LOG_DIR/podman-api.stderr.log"
+# graceful stop: a podman process should not be killed in the middle of an operation
+STOP_TIMEOUT=45
+
+if [[ ! "$ACTION" =~ ^(start|stop)$ ]]; then
+  echo "Usage: $0 {start|stop}" >&2
+  exit 1
+fi
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+exec 1>> "$LOG_DIR/ctl.stdout.log"
+exec 2>> "$LOG_DIR/ctl.stderr.log"
+source /var/vcap/packages/common/script_utils.sh
+
+if [[ ! -f /var/vcap/jobs/podman/bin/podman-env.sh ]]; then
+  log_error "the podman-api job requires the podman job on the same instance group"
+  exit 1
+fi
+# podman configuration comes from /etc/containers (linked by the podman job)
+source /var/vcap/jobs/podman/bin/podman-env.sh
+
+function pid_alive() {
+  [[ -n "${1:-}" ]] && kill -0 "$1" 2> /dev/null
+}
+
+function secure_socket() {
+  # $1: pid of the service
+  # the service creates the socket a moment after it starts
+  for ((i = 0; i < 30; i++)); do
+    [[ -S "$SOCKET" ]] && break
+    sleep 1
+  done
+  if [[ ! -S "$SOCKET" ]]; then
+    # do not leave a running service behind: monit would take it as started
+    log_error "podman API socket $SOCKET not found, see $ERR_LOG"
+    kill -KILL "$1" 2> /dev/null || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
+  if [[ -n "$GROUP_GID" ]]; then
+    chown "root:$GROUP_GID" "$SOCKET"
+    chmod 0660 "$SOCKET"
+  else
+    chown root:root "$SOCKET"
+    chmod 0600 "$SOCKET"
+  fi
+}
+
+case "$ACTION" in
+  start)
+    if pid_alive "$(cat "$PID_FILE" 2> /dev/null || true)"; then
+      log_info "podman-api is already running"
+      exit 0
+    fi
+    # the directory is what clients mount: its mode limits access before the socket exists
+    mkdir -p "$SOCKET_DIR"
+    if [[ -n "$GROUP_GID" ]]; then
+      chown "root:$GROUP_GID" "$SOCKET_DIR"
+      chmod 0750 "$SOCKET_DIR"
+    else
+      chown root:root "$SOCKET_DIR"
+      chmod 0700 "$SOCKET_DIR"
+    fi
+    rm -f "$SOCKET"
+    log_info "starting podman API service on $SOCKET (group gid: ${GROUP_GID:-root only})"
+    # until secure_socket runs, the directory mode keeps other users away from the socket;
+    # --time=0: the service never expires (with a timeout it exits when idle and monit restarts it)
+    setsid podman system service --time=0 "unix://$SOCKET" >> "$OUT_LOG" 2>> "$ERR_LOG" < /dev/null &
+    pid=$!
+    echo "$pid" > "$PID_FILE"
+    secure_socket "$pid"
+    ;;
+
+  stop)
+    pid=$(cat "$PID_FILE" 2> /dev/null || true)
+    if pid_alive "$pid"; then
+      log_info "stopping podman-api (pid $pid)"
+      kill -TERM "$pid"
+      for ((i = 0; i < STOP_TIMEOUT; i++)); do
+        pid_alive "$pid" || break
+        sleep 1
+      done
+      if pid_alive "$pid"; then
+        log_warn "podman-api did not stop within ${STOP_TIMEOUT}s, killing it"
+        kill -KILL "$pid" || true
+      fi
+    fi
+    rm -f "$PID_FILE" "$SOCKET"
+    ;;
+esac

@@ -25,6 +25,7 @@ ArchiMate model (open with [Archi](https://www.archimatetool.com/)): [docs/archi
 | `podman`          | Podman engine configuration (no process).                                                              |
 | `pods`            | Runs the Kubernetes YAML definitions: monit process `pod-<name>` each.                                 |
 | `podman-exporter` | Prometheus metrics of containers, pods, images and volumes (`:9882/metrics`), read via the podman API. |
+| `podman-api`      | Podman API service on a unix socket for clients in pods (CI/workflow engines, `podman --remote`).       |
 
 ### Deployment
 

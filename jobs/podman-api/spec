@@ -1,0 +1,33 @@
+---
+name: podman-api
+
+description: |
+  Podman API service (`podman system service`, Docker-compatible and libpod REST API) on a unix socket, for
+  clients running in pods of the `pods` job: CI/workflow engines, `podman --remote`, docker CLI with DOCKER_HOST.
+  Mount the socket directory into a container with a hostPath volume. Monit process `podman-api`.
+  Requires the `podman` job on the same instance.
+
+  The socket is root-equivalent: a client can start privileged containers and mount any host path. By default
+  only root can use it; `podman_api.group_gid` opens it to one group, e.g. the supplementary group of a
+  non-root container (pod-level `spec.securityContext.supplementalGroups`). Use it on dedicated instances only.
+
+templates:
+  bin/ctl.sh.erb: bin/ctl
+
+packages:
+- podman
+- common
+
+properties:
+  podman_api.socket_dir:
+    description: |
+      Directory of the socket (`podman.sock`), recreated on start. Mount the directory, not the socket file:
+      the socket is replaced on every restart of the service.
+    default: /var/vcap/sys/run/podman-api
+  podman_api.group_gid:
+    description: |
+      Numeric GID allowed to use the socket (directory 0750, socket 0660, group = this GID). The group does not
+      have to exist on the VM: containers of the `pods` job share the host's GIDs (no user namespace).
+      Empty: root only (0700 / 0600).
+    default: ~
+    example: 2375

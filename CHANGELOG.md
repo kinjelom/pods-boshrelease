@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 (2026-11-18)
+
+### Added
+
+- `podman-api` job: podman API service (`podman system service`) on a unix socket for clients running in pods
+  (CI/workflow engines, `podman --remote`, docker CLI). Root-only by default; `podman_api.group_gid` opens it to one
+  group (directory 0750, socket 0660). See [docs/details.md](docs/details.md#podman-api-for-pods).
+
 ## 1.3.0 (2026-10-29)
 
 ### Added
